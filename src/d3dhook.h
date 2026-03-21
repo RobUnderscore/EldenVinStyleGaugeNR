@@ -11,4 +11,7 @@ void Shutdown();
 using RenderCallback = void(*)(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue);
 void SetRenderCallback(RenderCallback cb);
 
+// F7 position mode
+bool IsPositionMode();
+
 } // namespace D3DHook

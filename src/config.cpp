@@ -1,5 +1,6 @@
 #include "config.h"
 #include <Windows.h>
+#include <ShlObj.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,21 +9,36 @@ extern void Log(const char* fmt, ...);
 
 namespace Config {
 
-static char g_ConfigPath[MAX_PATH] = {};
+static char g_DllConfigPath[MAX_PATH] = {};
+static char g_UserConfigPath[MAX_PATH] = {};
 
-static const char* GetConfigPath() {
-    if (g_ConfigPath[0] == 0) {
-        // Config file sits next to the DLL
+static const char* GetDllConfigPath() {
+    if (g_DllConfigPath[0] == 0) {
         HMODULE hSelf = nullptr;
         GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&GetConfigPath, &hSelf);
-        GetModuleFileNameA(hSelf, g_ConfigPath, MAX_PATH);
-        // Replace .dll with .ini
-        char* dot = strrchr(g_ConfigPath, '.');
+            (LPCSTR)&GetDllConfigPath, &hSelf);
+        GetModuleFileNameA(hSelf, g_DllConfigPath, MAX_PATH);
+        char* dot = strrchr(g_DllConfigPath, '.');
         if (dot) strcpy(dot, ".ini");
     }
-    return g_ConfigPath;
+    return g_DllConfigPath;
+}
+
+static const char* GetUserConfigPath() {
+    if (g_UserConfigPath[0] == 0) {
+        char appdata[MAX_PATH] = {};
+        if (FAILED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
+            const char* env = getenv("APPDATA");
+            if (env) strncpy(appdata, env, MAX_PATH - 1);
+            else return GetDllConfigPath(); // fallback
+        }
+        char dir[MAX_PATH];
+        snprintf(dir, MAX_PATH, "%s\\VinStyleRankGauge", appdata);
+        CreateDirectoryA(dir, nullptr);
+        snprintf(g_UserConfigPath, MAX_PATH, "%s\\VinStyleRankGauge.ini", dir);
+    }
+    return g_UserConfigPath;
 }
 
 static float ReadFloat(FILE* f, const char* key, float defaultVal) {
@@ -85,16 +101,10 @@ static void WriteDefaultConfig(const char* path) {
     fclose(f);
 }
 
-GaugeConfig Load() {
+static GaugeConfig LoadFrom(const char* path) {
     GaugeConfig cfg;
-    const char* path = GetConfigPath();
-
     FILE* f = fopen(path, "r");
-    if (!f) {
-        Log("Config: no config file found, writing defaults to %s", path);
-        WriteDefaultConfig(path);
-        return cfg;
-    }
+    if (!f) return cfg;
 
     Log("Config: loading from %s", path);
     cfg.posX = ReadFloat(f, "posX", cfg.posX);
@@ -107,11 +117,59 @@ GaugeConfig Load() {
     cfg.showLabels = ReadBool(f, "showLabels", cfg.showLabels);
     cfg.showBorder = ReadBool(f, "showBorder", cfg.showBorder);
     fclose(f);
-
-    Log("Config: pos=(%.2f, %.2f) size=(%.0f, %.0f) font=%.1f opacity=%.2f bar=%d labels=%d border=%d",
-        cfg.posX, cfg.posY, cfg.gaugeWidth, cfg.gaugeHeight, cfg.fontSize, cfg.opacity,
-        cfg.showBar, cfg.showLabels, cfg.showBorder);
     return cfg;
+}
+
+GaugeConfig Load() {
+    // Try user config first (%APPDATA%), then DLL-relative
+    const char* userPath = GetUserConfigPath();
+    FILE* f = fopen(userPath, "r");
+    if (f) {
+        fclose(f);
+        GaugeConfig cfg = LoadFrom(userPath);
+        Log("Config: pos=(%.2f, %.2f) size=(%.0f, %.0f) font=%.1f opacity=%.2f bar=%d labels=%d border=%d",
+            cfg.posX, cfg.posY, cfg.gaugeWidth, cfg.gaugeHeight, cfg.fontSize, cfg.opacity,
+            cfg.showBar, cfg.showLabels, cfg.showBorder);
+        return cfg;
+    }
+
+    const char* dllPath = GetDllConfigPath();
+    f = fopen(dllPath, "r");
+    if (f) {
+        fclose(f);
+        GaugeConfig cfg = LoadFrom(dllPath);
+        Log("Config: pos=(%.2f, %.2f) size=(%.0f, %.0f) font=%.1f opacity=%.2f bar=%d labels=%d border=%d",
+            cfg.posX, cfg.posY, cfg.gaugeWidth, cfg.gaugeHeight, cfg.fontSize, cfg.opacity,
+            cfg.showBar, cfg.showLabels, cfg.showBorder);
+        return cfg;
+    }
+
+    Log("Config: no config file found, writing defaults to %s", dllPath);
+    WriteDefaultConfig(dllPath);
+    return GaugeConfig{};
+}
+
+void Save(const GaugeConfig& cfg) {
+    const char* path = GetUserConfigPath();
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        Log("Config: failed to save to %s", path);
+        return;
+    }
+
+    fprintf(f, "# VinStyleRankGauge Configuration (saved by F7 position mode)\n");
+    fprintf(f, "posX = %.4f\n", cfg.posX);
+    fprintf(f, "posY = %.4f\n", cfg.posY);
+    fprintf(f, "gaugeWidth = %.0f\n", cfg.gaugeWidth);
+    fprintf(f, "gaugeHeight = %.0f\n", cfg.gaugeHeight);
+    fprintf(f, "fontSize = %.1f\n", cfg.fontSize);
+    fprintf(f, "opacity = %.2f\n", cfg.opacity);
+    fprintf(f, "showBar = %d\n", cfg.showBar ? 1 : 0);
+    fprintf(f, "showLabels = %d\n", cfg.showLabels ? 1 : 0);
+    fprintf(f, "showBorder = %d\n", cfg.showBorder ? 1 : 0);
+    fclose(f);
+
+    Log("Config: saved position (%.4f, %.4f) to %s", cfg.posX, cfg.posY, path);
 }
 
 } // namespace Config

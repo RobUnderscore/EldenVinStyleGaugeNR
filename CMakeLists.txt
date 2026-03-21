@@ -49,6 +49,7 @@ target_link_libraries(VinStyleRankGauge PRIVATE
     d3d12
     dxgi
     dwmapi
+    shell32
 )
 
 target_include_directories(VinStyleRankGauge PRIVATE src)

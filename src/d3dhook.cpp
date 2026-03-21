@@ -33,13 +33,89 @@ static bool                         g_InitAttempted = false;
 static RenderCallback               g_RenderCallback = nullptr;
 static PresentFn                    g_OrigPresent = nullptr;
 static ExecuteCommandListsFn        g_OrigExecuteCommandLists = nullptr;
+static bool                         g_PositionMode = false;
+
+// Cursor hooks for position mode
+using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
+using SetCursorPosFn = BOOL(WINAPI*)(int, int);
+using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+static ClipCursorFn       g_OrigClipCursor = nullptr;
+static SetCursorPosFn     g_OrigSetCursorPos = nullptr;
+static GetRawInputDataFn  g_OrigGetRawInputData = nullptr;
+static RECT               g_SavedClipRect = {};
+static bool               g_HadClipRect = false;
+
+static BOOL WINAPI hkClipCursor(const RECT* lpRect) {
+    if (g_PositionMode) {
+        if (lpRect) { g_SavedClipRect = *lpRect; g_HadClipRect = true; }
+        return TRUE;
+    }
+    return g_OrigClipCursor(lpRect);
+}
+
+static BOOL WINAPI hkSetCursorPos(int X, int Y) {
+    if (g_PositionMode) return TRUE;
+    return g_OrigSetCursorPos(X, Y);
+}
+
+static UINT WINAPI hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader) {
+    if (g_PositionMode && pData != nullptr) {
+        UINT result = g_OrigGetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+        if (result != (UINT)-1 && uiCommand == RID_INPUT) {
+            RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(pData);
+            if (raw->header.dwType == RIM_TYPEMOUSE) {
+                raw->data.mouse.lLastX = 0;
+                raw->data.mouse.lLastY = 0;
+                raw->data.mouse.ulButtons = 0;
+                raw->data.mouse.usButtonData = 0;
+            } else if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+                raw->data.keyboard.VKey = 0;
+                raw->data.keyboard.Message = 0;
+            }
+        }
+        return result;
+    }
+    return g_OrigGetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+}
 
 static void InitImGui(IDXGISwapChain3* swapChain);
 static void CleanupRenderTargets();
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return true;
+    // F7 toggles position mode
+    if (msg == WM_KEYDOWN && wParam == VK_F7) {
+        g_PositionMode = !g_PositionMode;
+        Log("Position mode: %s", g_PositionMode ? "ON (drag gauge)" : "OFF (locked)");
+
+        if (g_PositionMode) {
+            ImGui::GetIO().MouseDrawCursor = true;
+            if (g_OrigClipCursor) g_OrigClipCursor(nullptr);
+        } else {
+            ImGui::GetIO().MouseDrawCursor = false;
+            if (g_HadClipRect && g_OrigClipCursor) g_OrigClipCursor(&g_SavedClipRect);
+        }
+        return 0;
+    }
+
+    if (g_PositionMode) {
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+            return 0;
+
+        switch (msg) {
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+            case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+            case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+            case WM_KEYDOWN: case WM_KEYUP:
+            case WM_CHAR: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+            case WM_INPUT: case WM_SETCURSOR:
+                return 0;
+        }
+    } else {
+        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+    }
+
     return CallWindowProcW(g_OriginalWndProc, hWnd, msg, wParam, lParam);
 }
 
@@ -300,10 +376,32 @@ bool Init() {
     mhStatus = MH_CreateHook(execCmdAddr, reinterpret_cast<void*>(&hkExecuteCommandLists), reinterpret_cast<void**>(&g_OrigExecuteCommandLists));
     Log("MH_CreateHook(ExecuteCommandLists): %d", mhStatus);
 
+    // Cursor hooks for F7 position mode
+    auto clipCursorAddr = GetProcAddress(GetModuleHandleA("user32.dll"), "ClipCursor");
+    auto setCursorPosAddr = GetProcAddress(GetModuleHandleA("user32.dll"), "SetCursorPos");
+    auto getRawInputDataAddr = GetProcAddress(GetModuleHandleA("user32.dll"), "GetRawInputData");
+
+    if (clipCursorAddr) {
+        mhStatus = MH_CreateHook(clipCursorAddr, reinterpret_cast<void*>(&hkClipCursor), reinterpret_cast<void**>(&g_OrigClipCursor));
+        Log("MH_CreateHook(ClipCursor): %d", mhStatus);
+    }
+    if (setCursorPosAddr) {
+        mhStatus = MH_CreateHook(setCursorPosAddr, reinterpret_cast<void*>(&hkSetCursorPos), reinterpret_cast<void**>(&g_OrigSetCursorPos));
+        Log("MH_CreateHook(SetCursorPos): %d", mhStatus);
+    }
+    if (getRawInputDataAddr) {
+        mhStatus = MH_CreateHook(getRawInputDataAddr, reinterpret_cast<void*>(&hkGetRawInputData), reinterpret_cast<void**>(&g_OrigGetRawInputData));
+        Log("MH_CreateHook(GetRawInputData): %d", mhStatus);
+    }
+
     mhStatus = MH_EnableHook(MH_ALL_HOOKS);
     Log("MH_EnableHook: %d", mhStatus);
 
     return true;
+}
+
+bool IsPositionMode() {
+    return g_PositionMode;
 }
 
 void Shutdown() {

@@ -22,5 +22,6 @@ struct GaugeConfig {
 namespace Config {
 
 GaugeConfig Load();
+void Save(const GaugeConfig& cfg);
 
 } // namespace Config

@@ -1,6 +1,7 @@
 #include "overlay.h"
 #include "style_rank.h"
 #include "config.h"
+#include "d3dhook.h"
 #include <imgui.h>
 
 extern void Log(const char* fmt, ...);
@@ -9,6 +10,7 @@ namespace Overlay {
 
 static GaugeConfig g_Config;
 static bool g_ConfigLoaded = false;
+static bool g_WasPositionMode = false;
 
 static ImU32 ApplyOpacity(ImU32 color, float opacity) {
     int a = (int)(((color >> 24) & 0xFF) * opacity);
@@ -36,9 +38,23 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
         g_ConfigLoaded = true;
     }
 
+    bool posMode = D3DHook::IsPositionMode();
+
+    // Detect transition out of position mode -> save new position
+    if (g_WasPositionMode && !posMode) {
+        Log("Position mode ended, saving config");
+        Config::Save(g_Config);
+    }
+    g_WasPositionMode = posMode;
+
     StyleRankState state = StyleRank::Update();
     int rank = state.rank;
-    if (rank <= 0) return;
+
+    // In position mode, always show the gauge (use a fake rank for preview)
+    int displayRank = rank;
+    if (posMode && displayRank <= 0) displayRank = 5; // show "S" as preview
+
+    if (displayRank <= 0) return;
 
     float op = g_Config.opacity;
     auto& io = ImGui::GetIO();
@@ -49,23 +65,55 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     float gh = g_Config.gaugeHeight;
     float windowW = gw + 40.0f;
     float windowH = gh + 60.0f + (g_Config.showLabels ? 16.0f : 0.0f);
-    float posX = screenW * g_Config.posX - windowW * 0.5f;
-    float posY = screenH * g_Config.posY - windowH * 0.5f;
 
-    ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.0f);
+    if (posMode) {
+        // In position mode: let ImGui handle positioning (draggable)
+        // On first frame of position mode, snap to current config position
+        static bool firstFrame = true;
+        if (firstFrame || !g_WasPositionMode) {
+            float posX = screenW * g_Config.posX - windowW * 0.5f;
+            float posY = screenH * g_Config.posY - windowH * 0.5f;
+            ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
+            firstFrame = false;
+        }
+        ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.3f);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
-    ImGui::Begin("##StyleRank", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoBackground);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(20, 15, 5, 100));
+        ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(255, 180, 50, 200));
+        ImGui::Begin("##StyleRank", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing);
+
+        // Update config from current window position
+        ImVec2 wp = ImGui::GetWindowPos();
+        g_Config.posX = (wp.x + windowW * 0.5f) / screenW;
+        g_Config.posY = (wp.y + windowH * 0.5f) / screenH;
+    } else {
+        // Normal mode: locked, invisible, no input
+        float posX = screenW * g_Config.posX - windowW * 0.5f;
+        float posY = screenH * g_Config.posY - windowH * 0.5f;
+
+        ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.0f);
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
+        ImGui::Begin("##StyleRank", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoBackground);
+    }
+
+    rank = displayRank;
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos();
@@ -130,6 +178,16 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
                 draw->AddText(ImVec2(lx - lsize.x * 0.5f, barY + gh + 2.0f), labelColor, SEGMENT_LABELS[i]);
             }
         }
+    }
+
+    // Position mode hint
+    if (posMode) {
+        ImDrawList* bgDraw = ImGui::GetForegroundDrawList();
+        const char* hint = "F7: Drag gauge to reposition. Press F7 again to lock & save.";
+        ImVec2 hintSize = ImGui::CalcTextSize(hint);
+        float hx = (screenW - hintSize.x) * 0.5f;
+        bgDraw->AddRectFilled(ImVec2(hx - 8, 8), ImVec2(hx + hintSize.x + 8, 32), IM_COL32(0, 0, 0, 180), 4.0f);
+        bgDraw->AddText(ImVec2(hx, 12), IM_COL32(255, 200, 80, 255), hint);
     }
 
     ImGui::End();
