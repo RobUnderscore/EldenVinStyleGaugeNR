@@ -1,0 +1,63 @@
+Attaching...
+Ready. Build up style rank, then stop attacking and watch the drain.
+
+[  0.0s] rank=7 total=17.26  [2.26 1.27 4.68 3.14 1.76 0.28 3.87]
+[  0.5s] rank=7 total=18.78  [1.76 0.77 4.18 2.64 1.27 4.79 3.37]  drain rate: +3.041 game-sec/real-sec
+[  1.0s] rank=7 total=15.27  [1.26 0.27 3.68 2.14 0.76 4.29 2.87]  drain rate: -7.023 game-sec/real-sec
+[  1.5s] rank=7 total=16.77  [0.76 4.78 3.18 1.64 0.26 3.79 2.37]  drain rate: +3.002 game-sec/real-sec
+[  2.0s] rank=7 total=18.28  [0.26 4.28 2.68 1.14 4.77 3.29 1.87]  drain rate: +3.010 game-sec/real-sec
+[  2.5s] rank=7 total=19.76  [4.76 3.77 2.17 0.63 4.27 2.78 1.36]  drain rate: +2.960 game-sec/real-sec
+[  3.0s] rank=7 total=16.28  [4.27 3.28 1.68 0.14 3.77 2.29 0.87]  drain rate: -6.946 game-sec/real-sec
+[  3.5s] rank=7 total=17.79  [3.77 2.78 1.18 4.65 3.27 1.79 0.37]  drain rate: +3.017 game-sec/real-sec
+[  4.0s] rank=7 total=19.28  [3.26 2.27 0.67 4.14 2.77 1.29 4.87]  drain rate: +2.983 game-sec/real-sec
+[  4.5s] rank=7 total=15.78  [2.76 1.77 0.17 3.64 2.27 0.78 4.37]  drain rate: -7.002 game-sec/real-sec
+[  5.0s] rank=7 total=17.29  [2.26 1.27 4.69 3.14 1.77 0.28 3.87]  drain rate: +3.012 game-sec/real-sec
+[  5.5s] rank=7 total=18.79  [1.76 0.77 4.19 2.64 1.27 4.79 3.37]  drain rate: +3.006 game-sec/real-sec
+[  6.0s] rank=7 total=15.26  [1.26 0.27 3.68 2.14 0.76 4.29 2.87]  drain rate: -7.051 game-sec/real-sec
+[  6.5s] rank=7 total=16.79  [0.76 4.78 3.18 1.64 0.26 3.79 2.37]  drain rate: +3.059 game-sec/real-sec
+[  7.0s] rank=7 total=18.29  [0.26 4.28 2.68 1.14 4.77 3.29 1.87]  drain rate: +2.987 game-sec/real-sec
+[  7.5s] rank=7 total=19.82  [4.77 3.79 2.19 0.64 4.27 2.79 1.37]  drain rate: +3.049 game-sec/real-sec
+[  8.0s] rank=7 total=16.32  [4.27 3.29 1.69 0.14 3.77 2.29 0.87]  drain rate: -6.992 game-sec/real-sec
+[  8.5s] rank=7 total=17.83  [3.77 2.79 1.19 4.65 3.27 1.79 0.37]  drain rate: +3.020 game-sec/real-sec
+[  9.0s] rank=7 total=19.33  [3.27 2.28 0.68 4.15 2.77 1.29 4.88]  drain rate: +3.009 game-sec/real-sec
+[  9.5s] rank=7 total=15.80  [2.76 1.78 0.18 3.65 2.27 0.79 4.38]  drain rate: -7.059 game-sec/real-sec
+[ 10.0s] rank=7 total=17.34  [2.27 1.28 4.70 3.15 1.77 0.29 3.88]  drain rate: +3.075 game-sec/real-sec
+[ 10.5s] rank=7 total=18.81  [1.76 0.78 4.19 2.65 1.27 4.79 3.38]  drain rate: +2.939 game-sec/real-sec
+[ 11.0s] rank=7 total=15.31  [1.26 0.28 3.69 2.15 0.77 4.29 2.88]  drain rate: -6.992 game-sec/real-sec
+[ 11.5s] rank=7 total=16.81  [0.76 4.79 3.19 1.64 0.26 3.79 2.37]  drain rate: +2.989 game-sec/real-sec
+[ 12.0s] rank=7 total=18.44  [0.28 4.31 2.71 1.16 4.79 3.31 1.89]  drain rate: +3.255 game-sec/real-sec
+[ 12.5s] rank=7 total=19.82  [4.77 3.79 2.19 0.64 4.27 2.79 1.37]  drain rate: +2.762 game-sec/real-sec
+[ 13.0s] rank=7 total=16.31  [4.27 3.29 1.69 0.14 3.77 2.29 0.87]  drain rate: -7.006 game-sec/real-sec
+[ 13.5s] rank=7 total=17.82  [3.77 2.79 1.19 4.65 3.27 1.79 0.37]  drain rate: +3.018 game-sec/real-sec
+[ 14.0s] rank=6 total=14.48  [3.27 2.29 0.69 4.16 2.77 1.29]  drain rate: -6.683 game-sec/real-sec
+[ 14.5s] rank=6 total=11.47  [2.77 1.79 0.19 3.66 2.27 0.79]  drain rate: -6.011 game-sec/real-sec
+[ 15.0s] rank=6 total=13.45  [2.27 1.28 4.70 3.15 1.77 0.28]  drain rate: +3.970 game-sec/real-sec
+[ 15.5s] rank=6 total=15.48  [1.77 0.79 4.20 2.65 1.27 4.80]  drain rate: +4.057 game-sec/real-sec
+[ 16.0s] rank=6 total=12.46  [1.27 0.28 3.70 2.15 0.77 4.29]  drain rate: -6.047 game-sec/real-sec
+[ 16.5s] rank=6 total=14.49  [0.77 4.80 3.20 1.65 0.27 3.79]  drain rate: +4.057 game-sec/real-sec
+[ 17.0s] rank=6 total=16.48  [0.27 4.29 2.70 1.15 4.78 3.29]  drain rate: +3.971 game-sec/real-sec
+[ 17.5s] rank=6 total=18.48  [4.78 3.79 2.20 0.65 4.28 2.79]  drain rate: +4.013 game-sec/real-sec
+[ 18.0s] rank=6 total=15.50  [4.28 3.30 1.70 0.15 3.78 2.29]  drain rate: -5.955 game-sec/real-sec
+[ 18.5s] rank=6 total=17.50  [3.78 2.80 1.20 4.66 3.28 1.79]  drain rate: +3.997 game-sec/real-sec
+[ 19.0s] rank=6 total=14.50  [3.28 2.30 0.70 4.16 2.78 1.29]  drain rate: -5.996 game-sec/real-sec
+[ 19.5s] rank=6 total=11.50  [2.78 1.79 0.20 3.66 2.28 0.79]  drain rate: -6.006 game-sec/real-sec
+[ 20.0s] rank=6 total=13.48  [2.27 1.29 4.71 3.15 1.77 0.29]  drain rate: +3.973 game-sec/real-sec
+[ 20.5s] rank=6 total=15.49  [1.77 0.79 4.21 2.65 1.27 4.80]  drain rate: +4.015 game-sec/real-sec
+[ 21.0s] rank=6 total=12.51  [1.28 0.29 3.71 2.16 0.77 4.30]  drain rate: -5.957 game-sec/real-sec
+[ 21.5s] rank=6 total=14.50  [0.77 4.80 3.21 1.65 0.27 3.80]  drain rate: +3.976 game-sec/real-sec
+[ 22.0s] rank=6 total=16.52  [0.27 4.30 2.71 1.15 4.78 3.30]  drain rate: +4.020 game-sec/real-sec
+[ 22.5s] rank=6 total=18.52  [4.78 3.80 2.21 0.65 4.28 2.80]  drain rate: +4.012 game-sec/real-sec
+[ 23.0s] rank=6 total=15.51  [4.28 3.30 1.70 0.15 3.78 2.30]  drain rate: -6.022 game-sec/real-sec
+[ 23.5s] rank=6 total=17.51  [3.78 2.79 1.20 4.66 3.28 1.79]  drain rate: +4.002 game-sec/real-sec
+[ 24.0s] rank=6 total=14.51  [3.28 2.29 0.70 4.16 2.78 1.29]  drain rate: -5.993 game-sec/real-sec
+[ 24.5s] rank=6 total=11.51  [2.78 1.79 0.20 3.66 2.28 0.79]  drain rate: -5.993 game-sec/real-sec
+[ 25.0s] rank=6 total=13.52  [2.28 1.29 4.72 3.16 1.78 0.29]  drain rate: +4.018 game-sec/real-sec
+[ 25.5s] rank=6 total=15.54  [1.78 0.79 4.22 2.66 1.28 4.80]  drain rate: +4.016 game-sec/real-sec
+[ 26.0s] rank=6 total=12.54  [1.28 0.29 3.72 2.16 0.78 4.30]  drain rate: -5.993 game-sec/real-sec
+[ 26.5s] rank=6 total=14.53  [0.78 4.80 3.21 1.66 0.28 3.80]  drain rate: +3.994 game-sec/real-sec
+[ 27.0s] rank=6 total=16.53  [0.28 4.30 2.71 1.15 4.78 3.30]  drain rate: +3.981 game-sec/real-sec
+[ 27.5s] rank=6 total=18.55  [4.79 3.80 2.21 0.66 4.29 2.80]  drain rate: +4.045 game-sec/real-sec
+[ 28.0s] rank=6 total=15.55  [4.29 3.30 1.71 0.16 3.79 2.30]  drain rate: -5.993 game-sec/real-sec
+[ 28.5s] rank=6 total=17.54  [3.79 2.80 1.21 4.66 3.28 1.80]  drain rate: +3.967 game-sec/real-sec
+[ 29.0s] rank=6 total=14.53  [3.28 2.30 0.71 4.16 2.78 1.30]  drain rate: -6.006 game-sec/real-sec
+[ 29.5s] rank=6 total=11.53  [2.78 1.80 0.21 3.66 2.28 0.80]  drain rate: -5.994 game-sec/real-sec
