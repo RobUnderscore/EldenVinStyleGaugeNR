@@ -1,4 +1,4 @@
-# Elden Vins Style Rank Gauge - Technical Design Document
+# EldenVinStyleGaugeNR - Technical Design Document
 
 ## Overview
 

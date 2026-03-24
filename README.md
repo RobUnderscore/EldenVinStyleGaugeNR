@@ -1,4 +1,4 @@
-# VinStyleRankGauge
+# EldenVinStyleGaugeNR
 
 A real-time on-screen gauge overlay for Elden Ring Nightreign's **Elden Vins** mod style rank system. Displays your current style rank (D through V) with a DMC-inspired gauge, complete with glow effects, pulsing, and electricity crackling at higher ranks.
 
