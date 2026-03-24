@@ -159,7 +159,7 @@ specific damage tier buff (7000-7190).
 ## Implementation
 
 The overlay is implemented as a C++ DLL that hooks D3D12 via VTable discovery + MinHook.
-It renders using Dear ImGui and is loaded via Mod Engine 2's `[[natives]]` mechanism.
+It renders using Dear ImGui and is loaded via Mod Engine 3's `[[natives]]` mechanism.
 
 The DLL reads WorldChrMan via AOB scan, walks the SpEffect linked list every frame,
 counts active style effects, and renders the gauge using ImGui's draw API.

@@ -52,9 +52,9 @@ cmake --build . --config Release
 
 ## Installation
 
-### With Mod Engine 2 (recommended)
+### With Mod Engine 3 (recommended)
 
-1. Copy `VinStyleRankGauge.dll` to your Mod Engine 2 mod folder (the same one with Elden Vins).
+1. Copy `VinStyleRankGauge.dll` to your Mod Engine 3 mod folder (the same one with Elden Vins).
 
 2. Edit your `.me3` profile file and add the DLL under `[[natives]]`:
    ```toml
@@ -62,7 +62,7 @@ cmake --build . --config Release
    path = "VinStyleRankGauge.dll"
    ```
 
-3. Launch the game through Mod Engine 2 as usual.
+3. Launch the game through Mod Engine 3 as usual.
 
 ### With a DLL Injector
 
@@ -144,12 +144,12 @@ Works out of the box. The DLL hooks D3D12 directly via VTable discovery using a 
 The overlay works under Proton because:
 
 - Nightreign uses D3D12, which Proton translates to Vulkan via VKD3D-Proton
-- The DLL is loaded by Mod Engine 2 inside the Wine/Proton process, so it runs as native Windows code from the game's perspective
+- The DLL is loaded by Mod Engine 3 inside the Wine/Proton process, so it runs as native Windows code from the game's perspective
 - D3D12 hooks intercept API calls *before* VKD3D translation, so ImGui rendering goes through the same pipeline as the game
 
-**Setup is the same as Windows** — just configure Mod Engine 2 as you normally would for Proton and add the DLL to your `[[natives]]`.
+**Setup is the same as Windows** — just configure Mod Engine 3 as you normally would for Proton and add the DLL to your `[[natives]]`.
 
-The config file under Proton will be written relative to the DLL location (since `%APPDATA%` maps to a Wine prefix path). This still works fine — the file ends up in your Mod Engine 2 mod folder.
+The config file under Proton will be written relative to the DLL location (since `%APPDATA%` maps to a Wine prefix path). This still works fine — the file ends up in your Mod Engine 3 mod folder.
 
 ### Logging
 
