@@ -47,5 +47,5 @@ jobs:
           body: |
             Automated build from commit ${{ github.sha }}.
 
-            **Installation:** Extract the zip into your Mod Engine 3 mod folder and add the DLL to your profile's `[[natives]]`.
+            **Installation:** Extract the zip into a subfolder under your Mod Engine 3 mods directory (e.g. `nightreign-mods/style-rank-gauge/`) and add the DLL path to your `.me3` profile's `[[natives]]`. See the README for details.
           files: VinStyleRankGauge.zip

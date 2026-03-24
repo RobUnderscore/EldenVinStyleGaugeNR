@@ -54,12 +54,18 @@ cmake --build . --config Release
 
 ### With Mod Engine 3 (recommended)
 
-1. Copy `VinStyleRankGauge.dll` to your Mod Engine 3 mod folder (the same one with Elden Vins).
+1. Extract the release zip into a subfolder under your mods directory. For example, if your Nightreign profile references `nightreign-mods/`, create:
+   ```
+   nightreign-mods/
+     style-rank-gauge/
+       VinStyleRankGauge.dll
+       VinStyleRankGauge.ini    (optional — defaults are created automatically)
+   ```
 
-2. Edit your `.me3` profile file and add the DLL under `[[natives]]`:
+2. Edit your `.me3` profile file and add the DLL under `[[natives]]`, using the path relative to the profiles directory:
    ```toml
    [[natives]]
-   path = "VinStyleRankGauge.dll"
+   path = "nightreign-mods/style-rank-gauge/VinStyleRankGauge.dll"
    ```
 
 3. Launch the game through Mod Engine 3 as usual.
