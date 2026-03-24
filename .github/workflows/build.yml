@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Prepare release zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release | Out-Null
+          Copy-Item build/Release/VinStyleRankGauge.dll release/
+          Copy-Item VinStyleRankGauge.default.ini release/VinStyleRankGauge.ini
+          Compress-Archive -Path release/* -DestinationPath VinStyleRankGauge.zip
+
+      - name: Generate version tag
+        id: version
+        shell: bash
+        run: |
+          TAG="v1.0.$(git rev-list --count HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: VinStyleRankGauge ${{ steps.version.outputs.tag }}
+          body: |
+            Automated build from commit ${{ github.sha }}.
+
+            **Installation:** Extract the zip into your Mod Engine 3 mod folder and add the DLL to your profile's `[[natives]]`.
+          files: VinStyleRankGauge.zip
