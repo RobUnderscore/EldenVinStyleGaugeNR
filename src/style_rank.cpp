@@ -35,12 +35,20 @@ StyleRankState Update() {
     int count = 0;
     int styleCount = 0;
 
+    float minDur = 999.0f;
+    float maxDur = 0.0f;
+
     // Walk linked list, count active style effects
     do {
         int32_t id = Memory::Read<int32_t>(node + 0x08);
 
         if (id >= STYLE_EFFECT_MIN && id <= STYLE_EFFECT_MAX) {
             styleCount++;
+            float dur = Memory::Read<float>(node + 0x48);
+            if (dur > 0.0f) {
+                if (dur < minDur) minDur = dur;
+                if (dur > maxDur) maxDur = dur;
+            }
         }
 
         count++;
@@ -67,6 +75,8 @@ StyleRankState Update() {
 
     state.effectCount = styleCount;
     state.rank = s_displayedRank;
+    state.minDuration = (styleCount > 0 && minDur < 999.0f) ? minDur : 0.0f;
+    state.maxDuration = maxDur;
 
     return state;
 }

@@ -12,6 +12,7 @@ namespace Overlay {
 static GaugeConfig g_Config;
 static bool g_ConfigLoaded = false;
 static bool g_WasPositionMode = false;
+static bool g_SnapPosition = false;
 
 static ImU32 ApplyOpacity(ImU32 color, float opacity) {
     int a = (int)(((color >> 24) & 0xFF) * opacity);
@@ -121,7 +122,10 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
 
     bool posMode = D3DHook::IsPositionMode();
 
-    // Detect transition out of position mode -> save new position
+    // Detect transitions into/out of position mode
+    if (!g_WasPositionMode && posMode) {
+        g_SnapPosition = true; // snap window to config pos on entering
+    }
     if (g_WasPositionMode && !posMode) {
         Log("Position mode ended, saving config");
         Config::Save(g_Config);
@@ -149,13 +153,12 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
 
     if (posMode) {
         // In position mode: let ImGui handle positioning (draggable)
-        // On first frame of position mode, snap to current config position
-        static bool firstFrame = true;
-        if (firstFrame || !g_WasPositionMode) {
+        // Snap to config position on first frame of each position mode entry
+        if (g_SnapPosition) {
             float posX = screenW * g_Config.posX - windowW * 0.5f;
             float posY = screenH * g_Config.posY - windowH * 0.5f;
             ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
-            firstFrame = false;
+            g_SnapPosition = false;
         }
         ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.3f);
@@ -259,11 +262,6 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
             ApplyOpacity(IM_COL32(35, 32, 30, 200), op),  // top-right
             ApplyOpacity(IM_COL32(12, 10, 10, 200), op),  // bottom-right
             ApplyOpacity(IM_COL32(12, 10, 10, 200), op));  // bottom-left
-
-        // Rounded corners clip (redraw corners with background)
-        draw->AddRectFilled(
-            ImVec2(barX, barY), ImVec2(barX + gw, barY + gh),
-            IM_COL32(0, 0, 0, 0), rounding); // just for rounding
 
         // === FILL BAR (gradient + shine + pulse) ===
         float t = (float)ImGui::GetTime();

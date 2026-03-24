@@ -210,13 +210,13 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
     srvHeapDesc.NumDescriptors = 1;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = g_Device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&g_SrvDescHeap));
-    if (FAILED(hr)) { Log("InitImGui: SRV heap failed 0x%08X", hr); return; }
+    if (FAILED(hr)) { Log("InitImGui: SRV heap failed 0x%08X", hr); CleanupRenderTargets(); return; }
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvHeapDesc.NumDescriptors = g_FrameCount;
     hr = g_Device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&g_RtvDescHeap));
-    if (FAILED(hr)) { Log("InitImGui: RTV heap failed 0x%08X", hr); return; }
+    if (FAILED(hr)) { Log("InitImGui: RTV heap failed 0x%08X", hr); CleanupRenderTargets(); return; }
 
     g_CommandAllocators.resize(g_FrameCount);
     g_RenderTargets.resize(g_FrameCount);
@@ -226,15 +226,15 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
 
     for (UINT i = 0; i < g_FrameCount; i++) {
         hr = g_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_CommandAllocators[i]));
-        if (FAILED(hr)) { Log("InitImGui: CommandAllocator %u failed 0x%08X", i, hr); return; }
+        if (FAILED(hr)) { Log("InitImGui: CommandAllocator %u failed 0x%08X", i, hr); CleanupRenderTargets(); return; }
         hr = swapChain->GetBuffer(i, IID_PPV_ARGS(&g_RenderTargets[i]));
-        if (FAILED(hr)) { Log("InitImGui: GetBuffer %u failed 0x%08X", i, hr); return; }
+        if (FAILED(hr)) { Log("InitImGui: GetBuffer %u failed 0x%08X", i, hr); CleanupRenderTargets(); return; }
         g_Device->CreateRenderTargetView(g_RenderTargets[i], nullptr, rtvHandle);
         rtvHandle.ptr += rtvIncrement;
     }
 
     hr = g_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_CommandAllocators[0], nullptr, IID_PPV_ARGS(&g_CommandList));
-    if (FAILED(hr)) { Log("InitImGui: CommandList failed 0x%08X", hr); return; }
+    if (FAILED(hr)) { Log("InitImGui: CommandList failed 0x%08X", hr); CleanupRenderTargets(); return; }
     g_CommandList->Close();
 
     IMGUI_CHECKVERSION();
@@ -260,6 +260,9 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
 
     if (!ImGui_ImplDX12_Init(&initInfo)) {
         Log("InitImGui: ImGui_ImplDX12_Init failed!");
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        CleanupRenderTargets();
         return;
     }
     Log("InitImGui: ImGui DX12 initialized");

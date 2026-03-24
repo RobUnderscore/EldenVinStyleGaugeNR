@@ -20,7 +20,10 @@ static const char* GetDllConfigPath() {
             (LPCSTR)&GetDllConfigPath, &hSelf);
         GetModuleFileNameA(hSelf, g_DllConfigPath, MAX_PATH);
         char* dot = strrchr(g_DllConfigPath, '.');
-        if (dot) strcpy(dot, ".ini");
+        if (dot && (dot - g_DllConfigPath + 4) < MAX_PATH)
+            memcpy(dot, ".ini", 5); // includes null terminator
+        else
+            g_DllConfigPath[0] = 0; // can't form valid path
     }
     return g_DllConfigPath;
 }
@@ -48,8 +51,9 @@ static float ReadFloat(FILE* f, const char* key, float defaultVal) {
     while (fgets(line, sizeof(line), f)) {
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
-        // Match "key = value"
-        if (strncmp(line, key, keyLen) == 0) {
+        // Match "key = value" (key must be followed by '=' or whitespace)
+        if (strncmp(line, key, keyLen) == 0 &&
+            (line[keyLen] == '=' || line[keyLen] == ' ' || line[keyLen] == '\t')) {
             char* eq = strchr(line, '=');
             if (eq) return (float)atof(eq + 1);
         }
@@ -63,7 +67,8 @@ static bool ReadBool(FILE* f, const char* key, bool defaultVal) {
     size_t keyLen = strlen(key);
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
-        if (strncmp(line, key, keyLen) == 0) {
+        if (strncmp(line, key, keyLen) == 0 &&
+            (line[keyLen] == '=' || line[keyLen] == ' ' || line[keyLen] == '\t')) {
             char* eq = strchr(line, '=');
             if (eq) {
                 char* val = eq + 1;
