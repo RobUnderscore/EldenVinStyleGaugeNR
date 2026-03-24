@@ -6,6 +6,30 @@ A real-time on-screen gauge overlay for Elden Ring Nightreign's **Elden Vins** m
 ![D3D12](https://img.shields.io/badge/graphics-D3D12%20%2B%20ImGui-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Proton-orange)
 
+## Installation
+
+1. Download `VinStyleRankGauge.zip` from the [latest release](../../releases/latest).
+
+2. Extract the zip into a subfolder under your Mod Engine 3 mods directory:
+   ```
+   nightreign-mods/
+     style-rank-gauge/
+       VinStyleRankGauge.dll
+       VinStyleRankGauge.ini    (optional — defaults are created automatically)
+   ```
+
+3. Edit your `.me3` profile file and add the DLL under `[[natives]]`:
+   ```toml
+   [[natives]]
+   path = "nightreign-mods/style-rank-gauge/VinStyleRankGauge.dll"
+   ```
+
+4. Launch the game through Mod Engine 3 as usual.
+
+### With a DLL Injector
+
+Any DLL injector that can load into the `nightreign.exe` process will work. Inject after the game has loaded to the title screen.
+
 ## What It Does
 
 The Elden Vins mod adds a hidden style rank system to Nightreign. Attacking, deflecting, and perfect dodging builds a gauge that progresses through ranks D, C, B, A, S, SS, SSS, and V. Each rank provides an escalating damage bonus. The gauge decays when you stop attacking.
@@ -22,57 +46,6 @@ The Elden Vins mod adds a hidden style rank system to Nightreign. Attacking, def
 | SS   | 6             | ~2.27x         |
 | SSS  | 7             | ~2.69x         |
 | V    | 8+            | ~3.25x+        |
-
-## Building
-
-### Requirements
-
-- **Windows**: Visual Studio 2022 with C++ desktop development workload
-- **CMake** 3.20+
-
-### Build Steps
-
-1. Open a **VS2022 Developer PowerShell** (or regular PowerShell — the build script sets up the environment automatically).
-
-2. Run the build script:
-   ```powershell
-   .\build.ps1
-   ```
-
-3. The output DLL will be at `build\Release\VinStyleRankGauge.dll`.
-
-### Manual Build (without the script)
-
-```powershell
-mkdir build
-cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
-```
-
-## Installation
-
-### With Mod Engine 3 (recommended)
-
-1. Extract the release zip into a subfolder under your mods directory. For example, if your Nightreign profile references `nightreign-mods/`, create:
-   ```
-   nightreign-mods/
-     style-rank-gauge/
-       VinStyleRankGauge.dll
-       VinStyleRankGauge.ini    (optional — defaults are created automatically)
-   ```
-
-2. Edit your `.me3` profile file and add the DLL under `[[natives]]`, using the path relative to the profiles directory:
-   ```toml
-   [[natives]]
-   path = "nightreign-mods/style-rank-gauge/VinStyleRankGauge.dll"
-   ```
-
-3. Launch the game through Mod Engine 3 as usual.
-
-### With a DLL Injector
-
-Any DLL injector that can load into the `nightreign.exe` process will work. Inject after the game has loaded to the title screen.
 
 ## Usage
 
@@ -165,6 +138,18 @@ The config file under Proton will be written relative to the DLL location (since
 
 The DLL writes a log to `VinStyleRankGauge.log` in the game's working directory. Check this if the overlay doesn't appear — it logs each initialization step (AOB scan, D3D12 hook, ImGui setup) with success/failure status.
 
+## Visual Effects
+
+The gauge rendering includes several rank-dependent effects:
+
+- **Rank letter** with multi-layer glow and drop shadow
+- **Gauge bar** with gradient fill matching the rank color
+- **Pulsing** — brightness oscillation that increases in speed and intensity with rank
+- **Shine highlights** along the top edge and leading edge of the fill
+- **Segment dividers** splitting the bar into 8 rank sections with labels
+- **Electricity crackling** at S rank and above — random lightning bolts with branching, scaling from 2 bolts at S to 7 at V
+- **Ambient glow** at V rank — full-bar pulsing halo
+
 ## How It Works
 
 The overlay reads the game's memory to determine the current style rank. Here's the chain:
@@ -183,17 +168,32 @@ The D3D12 overlay:
 
 For full technical details including memory offsets and SpEffect structures, see [DESIGN.md](DESIGN.md).
 
-## Visual Effects
+## Building from Source
 
-The gauge rendering includes several rank-dependent effects:
+### Requirements
 
-- **Rank letter** with multi-layer glow and drop shadow
-- **Gauge bar** with gradient fill matching the rank color
-- **Pulsing** — brightness oscillation that increases in speed and intensity with rank
-- **Shine highlights** along the top edge and leading edge of the fill
-- **Segment dividers** splitting the bar into 8 rank sections with labels
-- **Electricity crackling** at S rank and above — random lightning bolts with branching, scaling from 2 bolts at S to 7 at V
-- **Ambient glow** at V rank — full-bar pulsing halo
+- **Windows**: Visual Studio 2022 with C++ desktop development workload
+- **CMake** 3.20+
+
+### Build Steps
+
+1. Open a **VS2022 Developer PowerShell** (or regular PowerShell — the build script sets up the environment automatically).
+
+2. Run the build script:
+   ```powershell
+   .\build.ps1
+   ```
+
+3. The output DLL will be at `build\Release\VinStyleRankGauge.dll`.
+
+### Manual Build (without the script)
+
+```powershell
+mkdir build
+cd build
+cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Release
+```
 
 ## Dependencies
 
@@ -201,9 +201,9 @@ All dependencies are vendored in `deps/` and built from source:
 
 | Library | Purpose | License |
 |---------|---------|---------|
-| [MinHook](https://github.com/TsudaKageworking/minhook) | Inline function hooking | BSD 2-Clause |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | Inline function hooking | BSD 2-Clause |
 | [Dear ImGui](https://github.com/ocornut/imgui) | Immediate-mode GUI rendering | MIT |
-| [Pattern16](https://github.com/Jenocn/Pattern16) | SIMD-accelerated AOB pattern scanning | MIT |
+| [Pattern16](https://github.com/Dasaav-dsv/Pattern16) | SIMD-accelerated AOB pattern scanning | MIT |
 
 ## License
 
