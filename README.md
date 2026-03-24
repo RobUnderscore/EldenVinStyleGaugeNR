@@ -81,6 +81,10 @@ Press **F7** to enter position mode:
 
 The position is saved to the config file and persists across sessions.
 
+### Steam Deck / Controller Users
+
+F7 repositioning requires a keyboard. On Steam Deck, you can either map F7 to a controller button via Steam Input, or set the position manually by editing `posX` and `posY` in the config file (see below). The defaults (0.5, 0.88) place the gauge at bottom center, which works well for most layouts.
+
 ## Configuration
 
 The overlay reads its settings from an INI file. On first launch, a default config is created automatically.
