@@ -156,42 +156,10 @@ The tier buff application logic is in `common_func.emevd.dcx` at byte offsets
 0xD700-0xDA00. This custom EMEVD event maps the accumulation state to the
 specific damage tier buff (7000-7190).
 
-## Implementation Plan for Overlay
+## Implementation
 
-### Option A: ME3 Native DLL (recommended)
-- Build a C++ DLL using EROverlay as template
-- Hook D3D12 via VTable + MinHook for ImGui overlay
-- Load via ME3 `[[natives]]` in the profile `.me3` file
-- Read WorldChrMan via AOB scan (pattern from Hexinton)
-- Walk SpEffect list every frame, count style effects
-- Render gauge using ImGui
+The overlay is implemented as a C++ DLL that hooks D3D12 via VTable discovery + MinHook.
+It renders using Dear ImGui and is loaded via Mod Engine 2's `[[natives]]` mechanism.
 
-### Option B: Standalone Python Overlay
-- Use `ReadProcessMemory` from a separate process
-- Transparent tkinter or pygame overlay window
-- Simpler but higher latency and needs manual process attachment
-
-### Option C: Cheat Engine Lua Script
-- Already proven working (ce_style_monitor.lua)
-- Can add D3D overlay via CE's built-in overlay features
-- Limited to when CE is attached
-
-## File Reference
-
-| File | Location | Purpose |
-|------|----------|---------|
-| ce_style_monitor.lua | /home/rob/me3-coop-nightreign/ | Proven CE Lua monitor |
-| ce_walk_full.lua | /home/rob/me3-coop-nightreign/ | Full SpEffect list dump |
-| ce_find_speffect3.lua | /home/rob/me3-coop-nightreign/ | ChrIns pointer debug |
-| compare_speffects.py | /home/rob/me3-coop-nightreign/ | Vanilla vs Vins diff tool |
-| extract_lua3.py | /home/rob/me3-coop-nightreign/ | BND4 Lua extractor |
-| style-rank-research.md | /home/rob/me3-coop-nightreign/ | Earlier research notes |
-| Hexinton CT | /home/rob/me3-coop-nightreign/ | Modified CE table |
-
-## Reference Repositories (cloned)
-
-| Repo | Path | Use |
-|------|------|-----|
-| EROverlay | /home/rob/me3-coop-nightreign/EROverlay/ | D3D12+ImGui overlay template |
-| TGA-CT | /home/rob/me3-coop-nightreign/TGA-CT/ | SpEffect list structure reference |
-| ELDENRING-INTERNAL | /home/rob/me3-coop-nightreign/ELDENRING-INTERNAL/ | Pointer chain reference |
+The DLL reads WorldChrMan via AOB scan, walks the SpEffect linked list every frame,
+counts active style effects, and renders the gauge using ImGui's draw API.
