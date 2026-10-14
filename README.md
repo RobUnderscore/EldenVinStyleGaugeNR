@@ -2,6 +2,10 @@
 
 A real-time on-screen gauge overlay for Elden Ring Nightreign's **Elden Vins** mod style rank system. Displays your current style rank (D through V) with a DMC-inspired gauge, complete with glow effects, pulsing, and electricity crackling at higher ranks.
 
+
+https://github.com/user-attachments/assets/ab3eab3d-3a92-4295-be60-719c36434909
+
+
 ![DLL Overlay](https://img.shields.io/badge/type-DLL%20overlay-blue)
 ![D3D12](https://img.shields.io/badge/graphics-D3D12%20%2B%20ImGui-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Proton-orange)
