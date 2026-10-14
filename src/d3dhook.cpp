@@ -184,8 +184,15 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain3* pSwapChain, UINT SyncInterval, 
 }
 
 static void WINAPI hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCmdLists, ID3D12CommandList* const* cmdLists) {
-    if (!g_CommandQueue) {
-        g_CommandQueue = queue;
+    // Capture ONLY the graphics queue. The game also submits on COMPUTE and COPY queues,
+    // and the order it first touches them is not deterministic (especially under Proton).
+    // Grabbing whichever queue submits first means we may later push our own DIRECT
+    // command list onto a copy/compute queue, which removes the device -> black screen.
+    if (!g_CommandQueue && queue) {
+        if (queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            g_CommandQueue = queue;
+            Log("Captured DIRECT command queue %p", (void*)queue);
+        }
     }
     g_OrigExecuteCommandLists(queue, numCmdLists, cmdLists);
 }

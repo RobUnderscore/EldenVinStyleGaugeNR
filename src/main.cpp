@@ -69,6 +69,17 @@ static DWORD WINAPI InitThread(LPVOID hModule) {
         Log("ERROR: D3D12 hook failed!");
     }
 
+    // Tell RelicCooker our MinHook detours are in place. Two MinHook instances
+    // patching the same Present concurrently can clobber each other, so it waits
+    // on this before installing its own (see RelicCooker/src/main.cpp). Manual-reset
+    // and never closed: it must stay signalled for the life of the process, and
+    // RelicCooker may not check until later. Signalled even if the hook failed —
+    // there is nothing left to race with either way.
+    if (HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, L"Local\\VinStyleRankGauge_HooksInstalled")) {
+        SetEvent(ready);
+        Log("Signalled VinStyleRankGauge_HooksInstalled");
+    }
+
     Log("Initialization complete");
     return 0;
 }
