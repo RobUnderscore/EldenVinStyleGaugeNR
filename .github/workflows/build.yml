@@ -16,6 +16,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # version tag counts commits; a shallow clone always gives v1.0.1
 
       - name: Configure CMake
         run: cmake -B build -A x64
