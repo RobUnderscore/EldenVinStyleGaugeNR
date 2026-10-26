@@ -6,6 +6,7 @@
 #include <Psapi.h>
 #include <vector>
 #include <cstdio>
+#include <cstring>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -21,6 +22,7 @@ using ExecuteCommandListsFn = void(WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12Com
 static ID3D12Device*                g_Device = nullptr;
 static ID3D12DescriptorHeap*        g_SrvDescHeap = nullptr;
 static ID3D12DescriptorHeap*        g_RtvDescHeap = nullptr;
+static ID3D12Resource*              g_GameTexture = nullptr; // SRV slot 1 (slot 0 is ImGui's font)
 static ID3D12CommandQueue*          g_CommandQueue = nullptr;
 static ID3D12GraphicsCommandList*   g_CommandList = nullptr;
 static std::vector<ID3D12CommandAllocator*> g_CommandAllocators;
@@ -214,7 +216,7 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
 
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.NumDescriptors = 1;
+    srvHeapDesc.NumDescriptors = 2;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = g_Device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&g_SrvDescHeap));
     if (FAILED(hr)) { Log("InitImGui: SRV heap failed 0x%08X", hr); CleanupRenderTargets(); return; }
@@ -277,6 +279,130 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
     g_OriginalWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_GameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
     g_Initialized = true;
     Log("InitImGui: success!");
+}
+
+uint64_t CreateTextureFromDds(const uint8_t* dds, size_t size) {
+    if (!g_Initialized || g_GameTexture || size < 0x94 ||
+        memcmp(dds, "DDS ", 4) != 0 || memcmp(dds + 0x54, "DX10", 4) != 0) return 0;
+
+    UINT height, width, dxgi;
+    memcpy(&height, dds + 0x0C, 4);
+    memcpy(&width, dds + 0x10, 4);
+    memcpy(&dxgi, dds + 0x80, 4);
+    DXGI_FORMAT format = (DXGI_FORMAT)dxgi;
+    UINT blockBytes;
+    switch (format) {
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+        blockBytes = 8; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        blockBytes = 16; break;
+    default:
+        Log("CreateTextureFromDds: unsupported format %u", dxgi);
+        return 0;
+    }
+    size_t rowBytes = (size_t)((width + 3) / 4) * blockBytes;
+    UINT blockRows = (height + 3) / 4;
+    if (0x94 + rowBytes * blockRows > size) { Log("CreateTextureFromDds: truncated DDS"); return 0; }
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = format;
+    texDesc.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+    ID3D12Resource* tex = nullptr;
+    if (FAILED(g_Device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)))) {
+        Log("CreateTextureFromDds: texture creation failed");
+        return 0;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT numRows;
+    UINT64 rowSize, uploadSize;
+    g_Device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSize, &uploadSize);
+
+    D3D12_RESOURCE_DESC bufDesc{};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = uploadSize;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap{ D3D12_HEAP_TYPE_UPLOAD };
+    ID3D12Resource* upload = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = false;
+
+    if (SUCCEEDED(g_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))) &&
+        SUCCEEDED(g_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+        SUCCEEDED(g_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list))) &&
+        SUCCEEDED(g_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && done) {
+        uint8_t* mapped = nullptr;
+        if (SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+            for (UINT r = 0; r < numRows; r++)
+                memcpy(mapped + footprint.Offset + (size_t)r * footprint.Footprint.RowPitch,
+                    dds + 0x94 + r * rowBytes, rowBytes);
+            upload->Unmap(0, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = tex;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = upload;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint = footprint;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = tex;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            list->ResourceBarrier(1, &barrier);
+            list->Close();
+
+            ID3D12CommandList* lists[] = { list };
+            g_CommandQueue->ExecuteCommandLists(1, lists);
+            g_CommandQueue->Signal(fence, 1);
+            fence->SetEventOnCompletion(1, done);
+            ok = WaitForSingleObject(done, 5000) == WAIT_OBJECT_0;
+        }
+    }
+    if (done) CloseHandle(done);
+    if (fence) fence->Release();
+    if (list) list->Release();
+    if (alloc) alloc->Release();
+    if (upload) upload->Release();
+    if (!ok) { tex->Release(); Log("CreateTextureFromDds: upload failed"); return 0; }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    UINT inc = g_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_SrvDescHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_SrvDescHeap->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += inc;
+    gpu.ptr += inc;
+    g_Device->CreateShaderResourceView(tex, &srv, cpu);
+    g_GameTexture = tex;
+    Log("CreateTextureFromDds: %ux%u format %u uploaded", width, height, dxgi);
+    return gpu.ptr;
 }
 
 void SetRenderCallback(RenderCallback cb) {
@@ -436,6 +562,7 @@ static void CleanupRenderTargets() {
     for (auto& rt : g_RenderTargets) { if (rt) { rt->Release(); rt = nullptr; } }
     for (auto& alloc : g_CommandAllocators) { if (alloc) { alloc->Release(); alloc = nullptr; } }
     if (g_CommandList) { g_CommandList->Release(); g_CommandList = nullptr; }
+    if (g_GameTexture) { g_GameTexture->Release(); g_GameTexture = nullptr; }
     if (g_SrvDescHeap) { g_SrvDescHeap->Release(); g_SrvDescHeap = nullptr; }
     if (g_RtvDescHeap) { g_RtvDescHeap->Release(); g_RtvDescHeap = nullptr; }
     if (g_Device) { g_Device->Release(); g_Device = nullptr; }

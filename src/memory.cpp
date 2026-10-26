@@ -8,9 +8,34 @@
 namespace Memory {
 
 static uintptr_t g_WorldChrMan = 0;
+static const GameLayout* g_Game = nullptr;
+
+static const GameLayout kGames[] = {
+    // Nightreign
+    { "nightreign.exe", "48 8B 05 ?? ?? ?? ?? 0F 28 F1 48 85 C0",
+      0x174e8, 0x190, 0x38, 0x48, 0 },
+    // Elden Ring 2.7.x (offsets from fromsoftware-rs; AOB resolves to the static at +0x3d6d018)
+    { "eldenring.exe", "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88",
+      0x1e508, 0x178, 0x30, 0x40, 999320800 },
+};
+
+const GameLayout* DetectGame() {
+    for (const auto& g : kGames) {
+        if (GetModuleHandleA(g.moduleName)) {
+            g_Game = &g;
+            return g_Game;
+        }
+    }
+    return nullptr;
+}
+
+const GameLayout* Game() {
+    return g_Game;
+}
 
 bool Init() {
-    g_WorldChrMan = AOBScan("48 8B 05 ?? ?? ?? ?? 0F 28 F1 48 85 C0");
+    if (!g_Game) return false;
+    g_WorldChrMan = AOBScan(g_Game->worldChrManAOB, g_Game->moduleName);
     if (g_WorldChrMan == 0) return false;
 
     // Resolve RIP-relative address
@@ -28,13 +53,13 @@ uintptr_t GetWorldChrMan() {
 uintptr_t GetChrIns() {
     uintptr_t wcm = GetWorldChrMan();
     if (wcm == 0) return 0;
-    return Read<uintptr_t>(wcm + 0x174e8);
+    return Read<uintptr_t>(wcm + g_Game->mainPlayer);
 }
 
 uintptr_t GetSpEffectCtrl() {
     uintptr_t chrIns = GetChrIns();
     if (chrIns == 0) return 0;
-    return Read<uintptr_t>(chrIns + 0x190);
+    return Read<uintptr_t>(chrIns + g_Game->specialEffect);
 }
 
 uintptr_t GetSpEffectListHead() {

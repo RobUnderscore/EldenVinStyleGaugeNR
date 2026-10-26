@@ -2,8 +2,14 @@
 #include "style_rank.h"
 #include "config.h"
 #include "d3dhook.h"
+#include "memory.h"
+#include "game_textures.h"
+#include <Windows.h>
 #include <imgui.h>
+#include <atomic>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 extern void Log(const char* fmt, ...);
 
@@ -114,6 +120,287 @@ static void DrawBolt(ImDrawList* draw, float x1, float y1, float x2, float y2,
     }
 }
 
+// Elden Ring HUD palette, sampled from the game's own bar sprites in 01_common.tpf
+// (SB_FE_01: MENU_FL_BarDeco for the gold trim, MENU_FL_Condition_Bar for the fill shading)
+static const ImU32 ER_GOLD       = IM_COL32(146, 139, 108, 255);
+static const ImU32 ER_GOLD_LIGHT = IM_COL32(181, 173, 132, 255);
+static const ImU32 ER_GOLD_DARK  = IM_COL32(92, 84, 70, 255);
+static const ImU32 ER_BASE       = IM_COL32(14, 14, 12, 210);
+
+// Fill colour climbs with the charge: ash grey -> glintstone blue -> frost silver -> grace gold
+// -> deep amber, then white-gold once the Ultimate is ready (blue reaches gold through silver,
+// since blending them directly goes muddy)
+static ImU32 UltTint(float fill) {
+    static const struct { float at; ImU32 col; } STOPS[] = {
+        { 0.00f, IM_COL32(128, 126, 122, 255) },
+        { 0.30f, IM_COL32(120, 160, 232, 255) },
+        { 0.50f, IM_COL32(220, 226, 236, 255) },
+        { 0.75f, IM_COL32(232, 190, 98, 255) },
+        { 0.95f, IM_COL32(238, 160, 62, 255) },
+        { 1.00f, IM_COL32(255, 242, 205, 255) },
+    };
+    const int n = sizeof(STOPS) / sizeof(STOPS[0]);
+    for (int i = 1; i < n; i++) {
+        if (fill <= STOPS[i].at)
+            return LerpColor(STOPS[i - 1].col, STOPS[i].col, (fill - STOPS[i - 1].at) / (STOPS[i].at - STOPS[i - 1].at));
+    }
+    return STOPS[n - 1].col;
+}
+
+// Black-and-white crackle like the Ultimate's own lightning: starts at 60% charge, builds toward
+// full, and arcs along the whole bar once ready. Bolts re-roll ~20 times a second.
+static void DrawUltLightning(ImDrawList* draw, float x, float y, float w, float h, float fill, float op) {
+    float fw = w * fill;
+    float k = (fill - 0.6f) / 0.4f;
+    if (k <= 0.0f || fw < 4.0f) return;
+    if (k > 1.0f) k = 1.0f;
+    bool ready = fill >= 1.0f;
+    float t = (float)ImGui::GetTime();
+    SeedRng((uint32_t)(t * 20.0f) * 2654435761u);
+
+    int bolts = ready ? 8 : 1 + (int)(k * 4.0f);
+    for (int b = 0; b < bolts; b++) {
+        if (RngFloat() < (ready ? 0.25f : 0.5f)) continue;
+        float sx, sy, ex, ey, jitter;
+        if (ready && (Rng() & 3) == 0) {
+            // Arc running along the fill
+            sx = x + RngFloat(0.0f, fw * 0.8f);
+            sy = y + h * RngFloat(0.3f, 0.7f);
+            ex = fminf(x + fw, sx + RngFloat(h * 2.0f, h * 5.0f));
+            ey = y + h * RngFloat(0.3f, 0.7f);
+            jitter = h * 0.35f;
+        } else {
+            // Spark off the top or bottom edge
+            bool top = Rng() & 1;
+            sx = x + RngFloat(fw * 0.15f, fw);
+            sy = top ? y : y + h;
+            float len = h * RngFloat(0.4f, 0.8f + k * 0.8f);
+            ex = sx + RngFloat(-h, h);
+            ey = top ? sy - len : sy + len;
+            jitter = h * (0.25f + 0.25f * k);
+        }
+        uint32_t seed = Rng();
+        float a = RngFloat(0.6f, 1.0f) * op;
+        // Same path twice: dark outline, then the white core
+        SeedRng(seed);
+        DrawBolt(draw, sx, sy, ex, ey, IM_COL32(0, 0, 0, (int)(170 * a)), 4, jitter, 3.0f);
+        SeedRng(seed);
+        DrawBolt(draw, sx, sy, ex, ey, IM_COL32(255, 255, 255, (int)(235 * a)), 4, jitter, 1.2f);
+        if (RngFloat() < 0.3f + 0.3f * k) {
+            float mx = (sx + ex) * 0.5f, my = (sy + ey) * 0.5f;
+            float bx = mx + RngFloat(-h, h), by = my + (ey - sy) * RngFloat(0.2f, 0.5f);
+            uint32_t bseed = Rng();
+            SeedRng(bseed);
+            DrawBolt(draw, mx, my, bx, by, IM_COL32(0, 0, 0, (int)(120 * a)), 3, jitter * 0.6f, 2.5f);
+            SeedRng(bseed);
+            DrawBolt(draw, mx, my, bx, by, IM_COL32(255, 255, 255, (int)(170 * a)), 3, jitter * 0.6f, 1.0f);
+        }
+        SeedRng(seed ^ 0x9E3779B9u);
+    }
+}
+
+static float s_UltTrail = 0.0f;     // drain trail, like the HP bar's damage trail
+static float s_UltTrailHold = 0.0f;
+
+static void HLine(ImDrawList* draw, float x0, float x1, float y, ImU32 col) {
+    draw->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + 1.0f), col);
+}
+
+// Elden Vins Ultimate charge, drawn as a fourth HUD bar under HP/FP/stamina:
+// dark base, gold trim, grainy pale fill (the Ultimate's lightning is black and white).
+// No text; a full bar shimmers and its end caps pulse.
+static void DrawUltimateBar(ImDrawList* draw, float x, float y, float w, float h, float fill, float op) {
+    x = floorf(x); y = floorf(y);
+    float t = (float)ImGui::GetTime();
+    float dt = ImGui::GetIO().DeltaTime;
+    bool ready = fill >= 1.0f;
+
+    // Trail holds briefly, then slides down to the real value
+    if (fill >= s_UltTrail) { s_UltTrail = fill; s_UltTrailHold = 0.6f; }
+    else if ((s_UltTrailHold -= dt) <= 0.0f) s_UltTrail = fmaxf(fill, s_UltTrail - dt * 0.35f);
+
+    float y0 = y + 1.0f, y1 = y + h - 1.0f;
+    draw->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), ApplyOpacity(ER_BASE, op));
+
+    float fw = floorf(w * fill);
+    float tw = floorf(w * s_UltTrail);
+    if (tw > fw)
+        draw->AddRectFilled(ImVec2(x + fw, y0), ImVec2(x + tw, y1), ApplyOpacity(IM_COL32(150, 140, 110, 140), op));
+
+    if (fw > 0.0f) {
+        // Shaded like the game's fill sprite: dimmer top, bright band low down, darker bottom edge
+        float mid = y0 + (y1 - y0) * 0.72f;
+        ImU32 tint = UltTint(fill);
+        ImU32 top = ApplyOpacity(Darken(tint, 0.35f), op);
+        ImU32 band = ApplyOpacity(tint, op);
+        ImU32 bottom = ApplyOpacity(Darken(tint, 0.5f), op);
+        draw->AddRectFilledMultiColor(ImVec2(x, y0), ImVec2(x + fw, mid), top, top, band, band);
+        draw->AddRectFilledMultiColor(ImVec2(x, mid), ImVec2(x + fw, y1), band, band, bottom, bottom);
+
+        // Fixed speckle so the fill reads as the game's textured metal rather than flat colour
+        SeedRng(0x5EED);
+        for (float gx = x; gx < x + fw; gx += 2.0f) {
+            float gy = RngFloat(y0, y1 - 2.0f);
+            float gl = RngFloat(1.0f, (y1 - y0) * 0.6f);
+            draw->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + 2.0f, gy + gl),
+                IM_COL32(40, 40, 45, (int)(RngFloat(0.0f, 45.0f) * op)));
+        }
+
+        if (ready) {
+            float cx = x + w * (fmodf(t * 0.6f, 1.6f) - 0.3f);
+            float bw = w * 0.18f;
+            ImU32 clear = IM_COL32(255, 255, 255, 0);
+            ImU32 lit = ApplyOpacity(IM_COL32(255, 255, 255, 110), op);
+            draw->PushClipRect(ImVec2(x, y0), ImVec2(x + fw, y1), true);
+            draw->AddRectFilledMultiColor(ImVec2(cx - bw, y0), ImVec2(cx, y1), clear, lit, lit, clear);
+            draw->AddRectFilledMultiColor(ImVec2(cx, y0), ImVec2(cx + bw, y1), lit, clear, clear, lit);
+            draw->PopClipRect();
+        }
+    }
+
+    // Gold trim as in MENU_FL_BarDeco: light line against the bar, darker line outside it
+    HLine(draw, x - 1, x + w + 1, y - 1, ApplyOpacity(ER_GOLD_LIGHT, op * 0.9f));
+    HLine(draw, x - 1, x + w + 1, y - 2, ApplyOpacity(ER_GOLD_DARK, op * 0.6f));
+    HLine(draw, x - 1, x + w + 1, y + h, ApplyOpacity(ER_GOLD, op * 0.9f));
+    HLine(draw, x - 1, x + w + 1, y + h + 1, ApplyOpacity(ER_GOLD_DARK, op * 0.6f));
+
+    float glow = ready ? 0.5f + 0.5f * sinf(t * 3.0f) : 0.0f;
+    ImU32 cap = ApplyOpacity(LerpColor(ER_GOLD, IM_COL32(240, 232, 190, 255), glow), op);
+    draw->AddRectFilled(ImVec2(x - 3, y - 3), ImVec2(x - 1, y + h + 3), cap);
+    draw->AddRectFilled(ImVec2(x + w + 1, y - 3), ImVec2(x + w + 3, y + h + 3), cap);
+
+    DrawUltLightning(draw, x, y, w, h, fill, op);
+}
+
+// The game's own HUD bar pieces, from SB_FE_01 in menu/hi/01_common.tpf (rects from 01_common.sblytbnd).
+// Loaded from Elden Vins' copy of that file in the pack, which sits next to this DLL's folder.
+struct Sprite { float x, y, w, h; };
+static const Sprite SPR_BASE   { 0, 29, 2926, 44 };  // MENU_FL_HP_Base: translucent dark band
+static const Sprite SPR_FILL   { 0, 469, 820, 26 };  // MENU_FL_Condition_Bar: white grain, tinted per bar
+static const Sprite SPR_TIP    { 2142, 453, 98, 40 }; // MENU_FL_BarEdge2: glowing leading edge
+static const Sprite SPR_DECO   { 0, 0, 2938, 25 };   // MENU_FL_BarDeco: gold line, ornament at the right end
+static const Sprite SPR_DECO_L { 1362, 397, 46, 38 }; // MENU_FL_BarDeco_L: ornament at the left end
+static const Sprite SPR_REGAIN { 3172, 0, 32, 64 };  // MENU_FL_HP_Regain: soft glow
+
+static std::vector<uint8_t> s_AtlasDds;
+static std::atomic<int> s_AtlasState{ 0 }; // 0 idle, 1 loading, 2 ready to upload, 3 uploaded, -1 unavailable
+static ImTextureID s_Atlas = 0;
+static float s_AtlasW = 1.0f, s_AtlasH = 1.0f;
+
+static DWORD WINAPI LoadAtlasThread(LPVOID) {
+    char path[MAX_PATH];
+    GameTextures::PathNextToDll("..\\elden-vins\\menu\\hi\\01_common.tpf.dcx", path, sizeof(path));
+    s_AtlasState = GameTextures::LoadDds(path, L"SB_FE_01", s_AtlasDds) ? 2 : -1;
+    return 0;
+}
+
+// Load in the background on first use, upload on the render thread once the bytes are ready
+static void UpdateAtlas() {
+    int st = s_AtlasState;
+    if (st == 0) {
+        s_AtlasState = 1;
+        HANDLE th = CreateThread(nullptr, 0, LoadAtlasThread, nullptr, 0, nullptr);
+        if (th) CloseHandle(th); else s_AtlasState = -1;
+    } else if (st == 2) {
+        if (s_AtlasDds.size() >= 0x14) {
+            uint32_t h, w;
+            memcpy(&h, s_AtlasDds.data() + 0x0C, 4);
+            memcpy(&w, s_AtlasDds.data() + 0x10, 4);
+            s_AtlasW = (float)w;
+            s_AtlasH = (float)h;
+        }
+        s_Atlas = D3DHook::CreateTextureFromDds(s_AtlasDds.data(), s_AtlasDds.size());
+        s_AtlasState = s_Atlas ? 3 : -1;
+        std::vector<uint8_t>().swap(s_AtlasDds);
+    }
+}
+
+// Draw the part (sx0,sy0)-(sx1,sy1) of a sprite, in sprite pixels, into a screen rect
+static void Blit(ImDrawList* draw, const Sprite& s, float sx0, float sy0, float sx1, float sy1,
+                 float x0, float y0, float x1, float y1, ImU32 col) {
+    if (x1 <= x0 || y1 <= y0) return;
+    draw->AddImage(ImTextureRef(s_Atlas), ImVec2(x0, y0), ImVec2(x1, y1),
+        ImVec2((s.x + sx0) / s_AtlasW, (s.y + sy0) / s_AtlasH),
+        ImVec2((s.x + sx1) / s_AtlasW, (s.y + sy1) / s_AtlasH), col);
+}
+
+// Same bar as DrawUltimateBar, built from the game's sprites. Scale: the fill sprite is 26px tall.
+static void DrawUltimateBarSprites(ImDrawList* draw, float x, float y, float w, float h, float fill, float op) {
+    x = floorf(x); y = floorf(y);
+    float s = h / 26.0f;
+    float t = (float)ImGui::GetTime();
+    float dt = ImGui::GetIO().DeltaTime;
+    bool ready = fill >= 1.0f;
+    ImU32 white = ApplyOpacity(IM_COL32_WHITE, op);
+
+    if (fill >= s_UltTrail) { s_UltTrail = fill; s_UltTrailHold = 0.6f; }
+    else if ((s_UltTrailHold -= dt) <= 0.0f) s_UltTrail = fmaxf(fill, s_UltTrail - dt * 0.35f);
+
+    Blit(draw, SPR_BASE, 16, 8, 2908, 36, x - 2 * s, y - s, x + w + 2 * s, y + h + s, white);
+
+    float fw = floorf(w * fill);
+    float tw = floorf(w * s_UltTrail);
+    if (tw > fw)
+        Blit(draw, SPR_FILL, 820 * fill, 0, 820 * s_UltTrail, 26, x + fw, y, x + tw, y + h,
+            ApplyOpacity(IM_COL32(200, 180, 120, 150), op));
+
+    ImU32 tint = UltTint(fill);
+    Blit(draw, SPR_FILL, 0, 0, 820 * fill, 26, x, y, x + fw, y + h, ApplyOpacity(tint, op));
+
+    if (ready) {
+        float cx = x + w * (fmodf(t * 0.6f, 1.6f) - 0.3f);
+        float bw = w * 0.18f;
+        ImU32 clear = IM_COL32(255, 255, 255, 0);
+        ImU32 lit = ApplyOpacity(IM_COL32(255, 255, 255, 90), op);
+        draw->PushClipRect(ImVec2(x, y + 2 * s), ImVec2(x + fw, y + h - 2 * s), true);
+        draw->AddRectFilledMultiColor(ImVec2(cx - bw, y), ImVec2(cx, y + h), clear, lit, lit, clear);
+        draw->AddRectFilledMultiColor(ImVec2(cx, y), ImVec2(cx + bw, y + h), lit, clear, clear, lit);
+        draw->PopClipRect();
+    }
+
+    if (fw > 0.0f) {
+        // Bright edge column (92) of the tip sits on the end of the fill
+        float tipA = ready ? 0.75f + 0.25f * sinf(t * 3.0f) : 1.0f;
+        draw->PushClipRect(ImVec2(x, y - 10 * s), ImVec2(x + fw + 6 * s, y + h + 10 * s), true);
+        Blit(draw, SPR_TIP, 0, 0, 98, 40, x + fw - 92 * s, y - 9 * s, x + fw + 6 * s, y + 31 * s,
+            ApplyOpacity(LerpColor(IM_COL32_WHITE, tint, 0.5f), op * tipA));
+        draw->PopClipRect();
+    }
+
+    // Gold line just under the bar, its ornament end at the right, the left ornament at the start
+    float ly = y + h + s - 15 * s;
+    float end = 200 * s;
+    float rx = x + w + 8 * s;
+    Blit(draw, SPR_DECO, 0, 0, 2938 - 200, 25, x - 4 * s, ly, rx - end, ly + 25 * s, white);
+    Blit(draw, SPR_DECO, 2938 - 200, 0, 2938, 25, rx - end, ly, rx, ly + 25 * s, white);
+    Blit(draw, SPR_DECO_L, 0, 0, 46, 38, x - 30 * s, ly - 13 * s, x + 16 * s, ly + 25 * s, white);
+
+    if (ready) {
+        float g = 0.5f + 0.5f * sinf(t * 3.0f);
+        float gs = h * 1.3f;
+        Blit(draw, SPR_REGAIN, 0, 0, 32, 64, x + w - gs * 0.5f, y + h * 0.5f - gs, x + w + gs * 0.5f, y + h * 0.5f + gs,
+            ApplyOpacity(tint, op * (0.5f + 0.5f * g)));
+    }
+
+    DrawUltLightning(draw, x, y, w, h, fill, op);
+}
+
+static void FinishWindow(bool posMode, float screenW) {
+    // Position mode hint
+    if (posMode) {
+        ImDrawList* bgDraw = ImGui::GetForegroundDrawList();
+        const char* hint = "F7: Drag gauge to reposition. Press F7 again to lock & save.";
+        ImVec2 hintSize = ImGui::CalcTextSize(hint);
+        float hx = (screenW - hintSize.x) * 0.5f;
+        bgDraw->AddRectFilled(ImVec2(hx - 8, 8), ImVec2(hx + hintSize.x + 8, 32), IM_COL32(0, 0, 0, 180), 4.0f);
+        bgDraw->AddText(ImVec2(hx, 12), IM_COL32(255, 200, 80, 255), hint);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
 void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     if (!g_ConfigLoaded) {
         g_Config = Config::Load();
@@ -134,6 +421,14 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
 
     StyleRankState state = StyleRank::Update();
     int rank = state.rank;
+
+    // Elden Ring shows the Ultimate charge bar (style ranks there never fire)
+    bool ultMode = Memory::Game() && Memory::Game()->ultEffectId != 0;
+    if (ultMode) UpdateAtlas();
+    if (ultMode && state.fill < 0.0f) {
+        s_UltTrail = 0.0f;
+        if (posMode) state.fill = 0.6f; // preview while dragging
+    }
 
     // In position mode, always show the gauge (use a fake rank for preview)
     int displayRank = rank;
@@ -203,8 +498,16 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     ImVec2 wp = ImGui::GetWindowPos();
     float centerX = wp.x + windowW * 0.5f;
 
+    if (ultMode && state.fill >= 0.0f) {
+        float bx = wp.x + 20.0f, by = wp.y + (windowH - gh) * 0.5f;
+        if (s_AtlasState == 3) DrawUltimateBarSprites(draw, bx, by, gw, gh, state.fill, op);
+        else DrawUltimateBar(draw, bx, by, gw, gh, state.fill, op);
+        FinishWindow(posMode, screenW);
+        return;
+    }
+
     RankStyle rs = GetRankStyle(rank);
-    const char* rankName = RANK_NAMES[rank];
+    const char* rankName = state.label ? state.label : RANK_NAMES[rank];
 
     // === RANK LETTER with glow ===
     ImGui::SetWindowFontScale(g_Config.fontSize);
@@ -238,7 +541,7 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
         float rounding = gh * 0.35f; // capsule-ish rounding
 
         // === OUTER GLOW (soft halo behind the bar) ===
-        float fillWidth = gw * (float)rank / 8.0f;
+        float fillWidth = gw * (state.fill >= 0.0f ? state.fill : (float)rank / 8.0f);
         if (fillWidth > 2) {
             ImU32 outerGlow = (rs.glow & 0x00FFFFFF) | ((ImU32)(int)(20 * op) << 24);
             draw->AddRectFilled(
@@ -332,7 +635,7 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
         }
 
         // === SEGMENT LABELS ===
-        if (g_Config.showLabels) {
+        if (g_Config.showLabels && !state.label) {
             for (int i = 0; i < 8; i++) {
                 float lx = barX + gw * (float)i / 8.0f + gw / 16.0f;
                 ImU32 labelColor;
@@ -407,19 +710,7 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
         }
     }
 
-    // Position mode hint
-    if (posMode) {
-        ImDrawList* bgDraw = ImGui::GetForegroundDrawList();
-        const char* hint = "F7: Drag gauge to reposition. Press F7 again to lock & save.";
-        ImVec2 hintSize = ImGui::CalcTextSize(hint);
-        float hx = (screenW - hintSize.x) * 0.5f;
-        bgDraw->AddRectFilled(ImVec2(hx - 8, 8), ImVec2(hx + hintSize.x + 8, 32), IM_COL32(0, 0, 0, 180), 4.0f);
-        bgDraw->AddText(ImVec2(hx, 12), IM_COL32(255, 200, 80, 255), hint);
-    }
-
-    ImGui::End();
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(2);
+    FinishWindow(posMode, screenW);
 }
 
 } // namespace Overlay

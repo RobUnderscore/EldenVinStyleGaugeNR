@@ -8,6 +8,8 @@ struct StyleRankState {
     float minDuration = 0;  // Shortest remaining duration (closest to expiring)
     float maxDuration = 0;  // Longest remaining duration (freshest hit)
     float maxPossible = 5.0f; // Max duration per effect (5 seconds)
+    float fill = -1.0f;     // Bar fill 0..1 when set (ER Ultimate charge); <0 = rank/8
+    const char* label = nullptr; // Replaces the rank letter when set ("ULT" / "READY")
 
     const char* GetRankName() const {
         static const char* names[] = {

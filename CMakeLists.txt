@@ -40,6 +40,7 @@ add_library(VinStyleRankGauge SHARED
     src/style_rank.cpp
     src/overlay.cpp
     src/config.cpp
+    src/game_textures.cpp
 )
 
 target_link_libraries(VinStyleRankGauge PRIVATE

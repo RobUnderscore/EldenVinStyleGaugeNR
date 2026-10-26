@@ -31,15 +31,16 @@ static DWORD WINAPI InitThread(LPVOID hModule) {
 
     // Wait for the game to finish loading
     int waitCount = 0;
-    while (!GetModuleHandleA("nightreign.exe")) {
+    const Memory::GameLayout* game;
+    while (!(game = Memory::DetectGame())) {
         Sleep(1000);
         waitCount++;
         if (waitCount > 60) {
-            Log("Timeout waiting for nightreign.exe");
+            Log("Timeout waiting for nightreign.exe / eldenring.exe");
             return 1;
         }
     }
-    Log("nightreign.exe found, waiting for game init...");
+    Log("%s found, waiting for game init...", game->moduleName);
     Sleep(5000);
 
     // Initialize memory reading
