@@ -43,6 +43,7 @@ add_library(VinStyleRankGauge SHARED
     src/game_textures.cpp
     src/buff_timers.cpp
     src/convenience_menu.cpp
+    src/hotkey_sheet.cpp
 )
 
 target_link_libraries(VinStyleRankGauge PRIVATE

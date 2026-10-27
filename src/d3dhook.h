@@ -21,6 +21,9 @@ bool IsPositionMode();
 // F8 convenience menu (owns mouse and keyboard while open, like F7)
 bool IsMenuOpen();
 
+// F6 hotkey list (display only, doesn't take input)
+bool IsHotkeySheetOpen();
+
 // Upload a block-compressed DDS (top mip only) into the overlay's descriptor heap (up to 7 of them).
 // Returns its ImGui texture id, or 0 on failure. Call from the render callback.
 uint64_t CreateTextureFromDds(const uint8_t* dds, size_t size);

@@ -32,7 +32,7 @@ static std::vector<ID3D12CommandAllocator*> g_CommandAllocators;
 static std::vector<ID3D12Resource*> g_RenderTargets;
 static UINT                         g_FrameCount = 0;
 static HWND                         g_GameWindow = nullptr;
-static WNDPROC                      g_OriginalWndProc = nullptr;
+static HHOOK                        g_MsgHook = nullptr;       // WH_GETMESSAGE hook for our input
 static bool                         g_Initialized = false;
 static bool                         g_InitAttempted = false;
 static RenderCallback               g_RenderCallback = nullptr;
@@ -40,6 +40,7 @@ static PresentFn                    g_OrigPresent = nullptr;
 static ExecuteCommandListsFn        g_OrigExecuteCommandLists = nullptr;
 static bool                         g_PositionMode = false;
 static bool                         g_MenuOpen = false;     // F8 convenience menu
+static bool                         g_HotkeysOpen = false;  // F6 hotkey list (display only)
 
 // While dragging (F7) or in the menu (F8) the overlay owns the mouse and keyboard
 static bool InputCaptured() { return g_PositionMode || g_MenuOpen; }
@@ -90,10 +91,28 @@ static UINT WINAPI hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID
 static void InitImGui(IDXGISwapChain3* swapChain);
 static void CleanupRenderTargets();
 
-static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // F7 toggles position mode, F8 the convenience menu (Esc also closes it)
-    bool toggle = msg == WM_KEYDOWN && (wParam == VK_F7 || wParam == VK_F8 || (wParam == VK_ESCAPE && g_MenuOpen));
+// Our hotkeys and, while F7/F8 own the mouse and keyboard, ImGui's input. Runs from a
+// WH_GETMESSAGE hook on the game window's thread rather than a subclassed window procedure:
+// several mods in the pack subclass the game window, and a subclass installed in the wrong
+// order can cut ours out of the chain (F6/F7/F8 stopped working that way). The hook sees
+// every posted keyboard/mouse message before any window procedure does.
+// Returns true when the message should be swallowed (turned into WM_NULL).
+static bool HandleInput(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // F7 toggles position mode, F8 the convenience menu (Esc also closes it), F6 the
+    // hotkey list. Only bare keys: other mods use modified ones (RadialMenu's editor is Shift+F7).
+    bool modified = (GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000;
+    bool firstPress = (lParam & (1 << 30)) == 0;  // not an auto-repeat
+    if (msg == WM_KEYDOWN && wParam == VK_F6 && !modified) {
+        if (firstPress) {
+            g_HotkeysOpen = !g_HotkeysOpen;
+            Log("Hotkey list: %s", g_HotkeysOpen ? "shown" : "hidden");
+        }
+        return true;
+    }
+    bool toggle = msg == WM_KEYDOWN && !modified &&
+        (wParam == VK_F7 || wParam == VK_F8 || (wParam == VK_ESCAPE && g_MenuOpen));
     if (toggle) {
+        if (!firstPress) return true;
         bool wasCaptured = InputCaptured();
         if (wParam == VK_F7) {
             g_PositionMode = !g_PositionMode;
@@ -110,29 +129,46 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ImGui::GetIO().MouseDrawCursor = false;
             if (g_HadClipRect && g_OrigClipCursor) g_OrigClipCursor(&g_SavedClipRect);
         }
-        return 0;
+        return true;
     }
 
-    if (InputCaptured()) {
-        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-            return 0;
-
-        switch (msg) {
-            case WM_MOUSEMOVE:
-            case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
-            case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
-            case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
-            case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
-            case WM_KEYDOWN: case WM_KEYUP:
-            case WM_CHAR: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
-            case WM_INPUT: case WM_SETCURSOR:
-                return 0;
-        }
-    } else {
-        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+    ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+    if (!InputCaptured()) return false;
+    switch (msg) {
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        case WM_KEYDOWN: case WM_KEYUP:
+        case WM_CHAR: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        case WM_INPUT:
+            return true;
     }
+    return false;
+}
 
-    return CallWindowProcW(g_OriginalWndProc, hWnd, msg, wParam, lParam);
+static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
+    // PM_NOREMOVE peeks see the same message again later: only act once, when it's taken
+    if (code == HC_ACTION && wParam == PM_REMOVE && g_Initialized) {
+        MSG* m = reinterpret_cast<MSG*>(lParam);
+        if (HandleInput(m->hwnd, m->message, m->wParam, m->lParam)) m->message = WM_NULL;
+    }
+    return CallNextHookEx(g_MsgHook, code, wParam, lParam);
+}
+
+// Which module's window procedure the game window currently starts with (diagnostics)
+static void LogWindowProcOwner(const char* when) {
+    if (!g_GameWindow) return;
+    void* proc = reinterpret_cast<void*>(GetWindowLongPtrW(g_GameWindow, GWLP_WNDPROC));
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(proc), &mod) && mod) {
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    }
+    const char* base = strrchr(name, '\\');
+    Log("Window proc %s: %p in %s", when, proc, base ? base + 1 : name);
 }
 
 static HRESULT WINAPI hkPresent(IDXGISwapChain3* pSwapChain, UINT SyncInterval, UINT Flags) {
@@ -140,6 +176,9 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain3* pSwapChain, UINT SyncInterval, 
         g_InitAttempted = true;
         InitImGui(pSwapChain);
     }
+    // see who else subclasses the window as the other mods finish starting up
+    static unsigned s_Frames = 0;
+    if (g_Initialized && (++s_Frames == 600 || s_Frames == 3600)) LogWindowProcOwner(s_Frames == 600 ? "after 600 frames" : "after 3600 frames");
 
     if (g_Initialized && g_CommandQueue) {
         __try {
@@ -305,7 +344,10 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
     }
     Log("InitImGui: ImGui DX12 initialized");
 
-    g_OriginalWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_GameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
+    DWORD windowThread = GetWindowThreadProcessId(g_GameWindow, nullptr);
+    g_MsgHook = SetWindowsHookExW(WH_GETMESSAGE, GetMsgProc, nullptr, windowThread);
+    Log("InitImGui: input hook on thread %lu: %s", windowThread, g_MsgHook ? "ok" : "FAILED");
+    LogWindowProcOwner("at init");
     g_Initialized = true;
     Log("InitImGui: success!");
 }
@@ -573,6 +615,10 @@ bool IsMenuOpen() {
     return g_MenuOpen;
 }
 
+bool IsHotkeySheetOpen() {
+    return g_HotkeysOpen;
+}
+
 bool IsPositionMode() {
     return g_PositionMode;
 }
@@ -582,8 +628,9 @@ void Shutdown() {
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
 
-    if (g_OriginalWndProc && g_GameWindow) {
-        SetWindowLongPtrW(g_GameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_OriginalWndProc));
+    if (g_MsgHook) {
+        UnhookWindowsHookEx(g_MsgHook);
+        g_MsgHook = nullptr;
     }
 
     if (g_Initialized) {

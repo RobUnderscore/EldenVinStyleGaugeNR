@@ -6,6 +6,7 @@
 #include "game_textures.h"
 #include "buff_timers.h"
 #include "convenience_menu.h"
+#include "hotkey_sheet.h"
 #include <Windows.h>
 #include <imgui.h>
 #include <atomic>
@@ -500,8 +501,10 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     g_WasPositionMode = posMode;
 
     DrawBuffTimers(posMode);
-    if (Memory::Game() && strcmp(Memory::Game()->moduleName, "eldenring.exe") == 0)
+    if (Memory::Game() && strcmp(Memory::Game()->moduleName, "eldenring.exe") == 0) {
+        HotkeySheet::Draw(D3DHook::TimerFont(), D3DHook::IsHotkeySheetOpen());
         ConvenienceMenu::Draw(D3DHook::TimerFont(), D3DHook::IsMenuOpen());
+    }
 
     StyleRankState state = StyleRank::Update();
     int rank = state.rank;
