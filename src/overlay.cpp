@@ -7,6 +7,7 @@
 #include "buff_timers.h"
 #include "convenience_menu.h"
 #include "hotkey_sheet.h"
+#include "coop_resync.h"
 #include <Windows.h>
 #include <imgui.h>
 #include <atomic>
@@ -503,6 +504,7 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     DrawBuffTimers(posMode);
     if (Memory::Game() && strcmp(Memory::Game()->moduleName, "eldenring.exe") == 0) {
         HotkeySheet::Draw(D3DHook::TimerFont(), D3DHook::IsHotkeySheetOpen());
+        CoopResync::DrawBanner(D3DHook::TimerFont());
         ConvenienceMenu::Draw(D3DHook::TimerFont(), D3DHook::IsMenuOpen());
     }
 

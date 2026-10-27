@@ -149,6 +149,18 @@ static DWORD WINAPI GiveThread(LPVOID param) {
     return ok ? 0 : 1;
 }
 
+bool GiveItem(uint32_t id, int quantity) {
+    if (!Memory::GetChrIns() || !Resolve()) return false;
+    auto* req = new GiveRequest{ id, quantity };
+    HANDLE th = CreateThread(nullptr, 0, GiveThread, req, 0, nullptr);
+    if (!th) {
+        delete req;
+        return false;
+    }
+    CloseHandle(th);
+    return true;
+}
+
 static void Give(const Entry& e) {
     char msg[256];
     if (!Memory::GetChrIns()) {

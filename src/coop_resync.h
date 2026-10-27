@@ -1,4 +1,5 @@
 #pragma once
+#include "imgui.h"
 
 // Elden Ring co-op "resync" (game 2.7.2.0), in the F8 menu:
 // - Resync players: repairs this game's copy of another player you can't see (revives a copy
@@ -7,6 +8,7 @@
 // - Reload here: reloads the map where you stand, which rebuilds every other player's character
 //   the way resting at a grace does.
 // - Go to host (guests only): the same reload, at the host's position.
+// - Invasions: the host summons AI Tarnished that every player sees and fights (spirit-ash buddies).
 // Game state is only touched on the game's own task thread (a recurring FrameBegin task); the
 // menu reads a snapshot and queues requests.
 namespace CoopResync {
@@ -20,5 +22,8 @@ void StartTask();
 
 // The "Co-op" block at the top of the F8 menu (between the window's Begin and End).
 void DrawMenuSection(float scale);
+
+// "Invaded by ...!" for a few seconds after an invader comes (every player's game).
+void DrawBanner(ImFont* font);
 
 } // namespace CoopResync

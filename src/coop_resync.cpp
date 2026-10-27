@@ -1,9 +1,13 @@
 #include "coop_resync.h"
+#include "convenience_menu.h"
+#include "game_textures.h"
 #include "imgui.h"
 #include "memory.h"
 #include <Windows.h>
 #include <MinHook.h>
+#include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -382,6 +386,7 @@ struct MemberView {
 static std::mutex s_Lock;
 static std::vector<MemberView> s_View;  // other players
 static int s_ViewLobby = 0;
+static bool s_ViewInGame = false;
 static std::string s_Message;
 static ULONGLONG s_MessageAt = 0;
 
@@ -417,6 +422,7 @@ static void Snapshot() {
     std::lock_guard<std::mutex> lock(s_Lock);
     s_View = std::move(view);
     s_ViewLobby = main ? lobby : 0;
+    s_ViewInGame = main != 0;
 }
 
 // ---- repairs (game task thread) ----
@@ -761,6 +767,8 @@ static void SendSpot(ULONGLONG now) {
     }
 }
 
+static void OnLinkMessage(uint64_t from, const uint8_t* data, int size, ULONGLONG now);  // invasions
+
 // SteamNetworkingMessage_t: +0 data, +8 size, +0x10 sender identity (type, size, Steam ID at +0x18)
 static void ReceiveSpots(ULONGLONG now) {
     void* net = s_NetMessages();
@@ -774,9 +782,10 @@ static void ReceiveSpots(ULONGLONG now) {
             int size = Rd<int32_t>(m + 8);
             uint64_t from = Rd<int32_t>(m + 0x10) == 16 ? Rd<uint64_t>(m + 0x18) : 0;
             SpotMsg msg;
-            if (from && data && size == (int)sizeof(msg)) {
+            // other messages can be the same size (the invaders' armor), so the magic decides
+            if (from && data && size == (int)sizeof(msg) && Rd<uint32_t>(reinterpret_cast<uintptr_t>(data)) == kSpotMagic) {
                 memcpy(&msg, data, sizeof(msg));
-                if (msg.magic == kSpotMagic && msg.version == kSpotVersion) {
+                if (msg.version == kSpotVersion) {
                     Heard h = { from, { msg.block, msg.x, msg.y, msg.z, msg.yaw }, msg.flags, now };
                     bool found = false;
                     for (Heard& old : s_Heard)
@@ -786,6 +795,8 @@ static void ReceiveSpots(ULONGLONG now) {
                         Log("CoopResync: link: hearing from %llX (at %08X)", (unsigned long long)from, (uint32_t)msg.block);
                     }
                 }
+            } else if (from && data && size > 8) {
+                OnLinkMessage(from, data, size, now);
             }
             s_Release(msgs[i]);
         }
@@ -842,6 +853,804 @@ static void GoToHost(ULONGLONG now) {
     SetMessage("Going to the host...");
 }
 
+// ---- invasions ----
+// AI Tarnished the whole party can see and fight (er-invasions/library.toml -> game data rows; the
+// Invaders.txt next to the DLL lists them). They are spirit-ash buddies, which the game and Seamless
+// Co-op already show on every player's game. The host summons one from code under a made-up owner
+// number (players are 1-6), so nobody's own summon slot is used, and every game makes buddies from
+// the invader NpcParam range hostile (team doesn't sync). The summon manager ([WorldChrMan+0x1e538])
+// files groups by owner number (PlayerGameData+8) and every frame dismisses a group whose owner isn't
+// in the player ChrSet (0x4b94b0: lookup, dismissal on a miss). That lookup now asks us: the ghost
+// owner is present while one of its invaders is alive (and a few seconds after, for the death fade),
+// so the game clears them away itself. Seamless Co-op already replaces that call (its hook #28), so
+// ours goes in front of whatever the call reached. The invaders live on the summoner's game and vanish
+// when it reloads (death respawn, fast travel), as a real invasion ends when its host dies.
+
+// (SummonBuddyManager): summon the group of the requested SpEffect (+0x20) at +0xa0/+0xb0 for the main player
+SITE(SUMMON_REQUEST, "summon the requested group", 0x4bbeb0, 0x48, 0x8b, 0xc4, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x58);
+// call <lookup>; test rax, rax; jne  (the dismissal check)
+static constexpr uintptr_t DISMISS_CALL = 0x4b94fa;
+static constexpr int32_t kGhostOwner = 9;
+static constexpr int32_t kInvaderNpcFirst = 591000000, kInvaderNpcLast = 591009999;
+static constexpr uint8_t kInvaderTeam = 27;
+static constexpr ULONGLONG kGhostLingerMs = 6000;
+static constexpr uint32_t kInvaderMagic = 0x49575356;  // "VSWI"
+static constexpr uint32_t kArmorMagic = 0x41575356;    // "VSWA"
+static constexpr ULONGLONG kArmorLeadMs = 600;         // the summon waits this long after the armor goes out
+// Param tables: SoloParamRepository [0x3d88f78]; table i's ResCap at +0x88 + 0x48 i (name at +0x18), its param
+// file at [[ResCap+0x80]+0x80]: row count u16 at +0xa, rows from +0x40, 0x18 bytes each {id, pad, data offset}
+static constexpr uintptr_t SOLO_PARAM_REPO = 0x3d88f78;
+static constexpr int kCharaInitTable = 0x17;
+static constexpr int kArmorFields[4] = { 0x20, 0x24, 0x28, 0x2c };  // CharaInitParam equip_Helm/Armer/Gaunt/Leg
+// (model param modifier module, {0, PhantomParam id, 0, 0, 0, 0}, 0): paint a character in a phantom look.
+// The game does it in each character's model update (0x3f8210, from its phantom id) but never for a
+// copy of another game's buddy (its modifier list stays empty, so no look shows), so those copies get
+// it from us every frame; the summoner's copy takes the look from its phantom override (+0x540)
+SITE(PHANTOM_APPLY, "apply a phantom look", 0x43c010, 0x40, 0x55, 0x56, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xb0, 0x48, 0x81, 0xec, 0x50, 0x01, 0x00, 0x00);
+// MsgRepository lookup (repo, version, category, id) -> text or null. Our NpcParam rows' nameId is
+// their own id, which has no text in any category; where the game finds none we answer with the
+// invader's name (the HP bar asks category 428). Seamless Co-op hooks this too (its own texts), so
+// ours goes in after it
+static constexpr uintptr_t MSG_LOOKUP = 0x2671370;
+static const uint8_t kMsgLookupBytes[] = { 0x3b, 0x51, 0x10, 0x73, 0x29, 0x44, 0x3b, 0x41, 0x14, 0x73, 0x23 };
+// (chr, SpEffect id, don't sync): every game applies the scaling to its own copy
+SITE(APPLY_SPEFFECT, "apply SpEffect", 0x3e8dc0, 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10, 0x57, 0x48, 0x81, 0xec, 0xc0);
+SITE(REMOVE_SPEFFECT, "remove SpEffect", 0x3ee2e0, 0x48, 0x8b, 0x89, 0x78, 0x01, 0x00, 0x00, 0xe9, 0x74, 0x94, 0x10, 0x00);
+
+// Invasions.ini next to the DLL; every key optional
+struct InvasionSettings {
+    bool autoOn = true;           // automatic invasions (the host's game decides)
+    int checkSeconds = 60;        // how often the host's game rolls
+    float guaranteeMinutes = 120; // an invasion is certain this long after the last one
+    float rampPower = 4;          // chance per roll = (minutes since the last / guaranteeMinutes) ^ rampPower
+    int lootChance = 50;          // percent, each player, per invader killed: one random item
+    float arriveMin = 40, arriveMax = 80;  // metres from the host, on ground the host walked, where they arrive
+    int look = 203;               // PhantomParam row invaders are drawn in on every game (0 = none)
+    bool randomArmor = true;      // a random armor set (any named piece) every spawn
+    int levelMargin = 10;         // invaders up to this many levels above the host can come
+};
+static InvasionSettings s_Inv;
+
+struct LootItem {
+    uint32_t id;   // with the category bits
+    int count;
+    std::string name;
+};
+static std::vector<LootItem> s_Loot;
+
+// Where the host has been, for arrivals: the main player's map position (block +0x6d0, position in it +0x6c0)
+// every half second. Not physics positions: the physics frame is re-centred as you travel (physics = map +
+// a whole-metre offset that changes, and differs per game), so old physics positions point at thin air.
+struct TrailPoint {
+    uint32_t block;
+    float p[4];
+    ULONGLONG at;
+};
+static std::vector<TrailPoint> s_Trail;
+static TrailPoint s_LastSample = {};
+static ULONGLONG s_NextTrail = 0, s_LastInvasion = 0, s_NextCheck = 0;
+static float s_ChanceNow = 0;
+
+struct InvaderEntry {
+    int32_t buddy, npc, chara, levelMin, levelMax, level;
+    std::string style, title;
+};
+// Invaders.txt "scaling <base> <levels per step> <last step>": toughness SpEffect = base + 1000 * party + step
+static int32_t s_ScaleBase = 0, s_ScaleStep = 5, s_ScaleLast = 0;
+
+struct ArmorPiece {
+    int32_t id;
+    std::string name;
+};
+static std::vector<ArmorPiece> s_Armor[4];  // InvaderArmor.txt by slot: head, body, arms, legs
+
+// The host's invasion between sending the armor and summoning
+struct PendingInvasion {
+    bool on = false;
+    const InvaderEntry* pick = nullptr;
+    std::string name;
+    int bucket = 0;
+    bool automatic = false;
+    ULONGLONG at = 0;
+};
+static PendingInvasion s_Pending;
+static std::vector<InvaderEntry> s_InvaderList;
+static std::vector<std::string> s_InvaderNames;
+static bool s_InvasionsOk = false;
+static uintptr_t s_PrevDismissLookup = 0;
+static bool s_NameHookTried = false;
+
+// The names the game's lookup gives our NpcParam rows: the build's title until an invader of that
+// row is named (any thread reads, the task thread writes; a torn read is a garbled name for a frame)
+struct NameSlot {
+    std::atomic<int32_t> id{ 0 };
+    wchar_t text[48];
+};
+static NameSlot s_NameSlots[96];
+static int s_NextNameSlot = 0;
+using MsgLookupFn = const wchar_t* (*)(void*, uint32_t, uint32_t, int32_t);
+static MsgLookupFn s_OrigMsgLookup = nullptr;
+static std::atomic<uint64_t> s_NameCategories[16];  // text categories we have answered (bits), for the log
+static std::atomic<uint32_t> s_NewNameCategory{ 0 };  // + 1
+static std::atomic<ULONGLONG> s_LastInvaderAlive{ 0 };
+static std::atomic<bool> s_WantInvader{ false };
+
+// What we know about the invaders in play (task thread)
+struct ActiveInvader {
+    uint64_t handle;
+    std::string name, title;
+    ULONGLONG seen;    // last time it was in the buddy set
+    int sends;         // announcements left to send (host)
+    ULONGLONG nextSend;
+    bool own = false;          // summoned by this game
+    bool rewarded = false;     // this player's loot roll is done
+    int bucket = -1;           // level catch-up steps (the summoner's game says; -1 = not yet)
+    int scaledId = 0;          // its toughness SpEffect on this game
+    ULONGLONG since = 0;       // first seen here
+    ULONGLONG topUpAt = 0;     // own invader: fill HP to the scaled maximum then
+    bool named = false;        // name and title are the summoner's (not a placeholder)
+    bool nameShown = false;    // the game's name lookup gives it
+    bool looked = false;       // logged its look
+};
+static std::vector<ActiveInvader> s_Active;
+
+#pragma pack(push, 1)
+struct InvaderMsg {
+    uint32_t magic;
+    uint16_t version;  // 2: bucket is the level catch-up step
+    uint16_t bucket;
+    uint64_t handle;   // FieldInsHandle, the same on every game
+    char name[24];
+    char title[40];
+};
+// Sent before the summon: every game dresses the build's CharaInitParam row the same way
+struct ArmorMsg {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    int32_t chara;
+    int32_t armor[4];
+};
+#pragma pack(pop)
+
+// The menu's view of them, and the banner
+struct InvaderView {
+    std::string name, title;
+    int hp, maxHp;
+};
+static std::vector<InvaderView> s_InvaderView;
+static std::string s_BannerName, s_BannerTitle, s_RewardText;
+static ULONGLONG s_BannerAt = 0, s_RewardAt = 0;
+
+// Executable memory within reach of a rel32 call from `from`
+static uint8_t* AllocNear(uintptr_t from, size_t size) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uintptr_t gran = si.dwAllocationGranularity;
+    for (uintptr_t a = (from & ~(gran - 1)) - gran; a > from - 0x7ff00000; a -= gran) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi))) break;
+        if (mbi.State != MEM_FREE) continue;
+        void* p = VirtualAlloc(reinterpret_cast<void*>(a), size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (p) return static_cast<uint8_t*>(p);
+    }
+    return nullptr;
+}
+
+// What the game's name lookup gives NpcParam row `npc` from now on
+static void SetInvaderName(int32_t npc, const std::string& name) {
+    if (npc < kInvaderNpcFirst || npc > kInvaderNpcLast) return;
+    wchar_t text[48] = {};
+    MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, text, 47);
+    NameSlot* slot = nullptr;
+    for (NameSlot& s : s_NameSlots)
+        if (s.id.load(std::memory_order_acquire) == npc) slot = &s;
+    if (slot && !wcscmp(slot->text, text)) return;
+    for (NameSlot& s : s_NameSlots)
+        if (!slot && !s.id.load(std::memory_order_acquire)) slot = &s;
+    if (!slot) slot = &s_NameSlots[s_NextNameSlot++ % (int)(sizeof(s_NameSlots) / sizeof(s_NameSlots[0]))];
+    slot->id.store(0, std::memory_order_release);
+    memcpy(slot->text, text, sizeof(text));
+    slot->id.store(npc, std::memory_order_release);
+}
+
+static const wchar_t* HkMsgLookup(void* repo, uint32_t version, uint32_t category, int32_t id) {
+    const wchar_t* text = s_OrigMsgLookup(repo, version, category, id);
+    if (text || id < kInvaderNpcFirst || id > kInvaderNpcLast) return text;
+    for (NameSlot& s : s_NameSlots) {
+        if (s.id.load(std::memory_order_acquire) != id) continue;
+        if (category < 1024) {
+            uint64_t bit = 1ull << (category & 63);
+            if (!(s_NameCategories[category >> 6].fetch_or(bit) & bit)) s_NewNameCategory.store(category + 1);
+        }
+        return s.text;
+    }
+    return nullptr;
+}
+
+// Once in the world (Seamless Co-op has hooked the lookup by then): our names go in front
+static void HookNames() {
+    s_NameHookTried = true;
+    uint8_t* site = reinterpret_cast<uint8_t*>(s_Base + MSG_LOOKUP);
+    bool seamless = site[0] == 0xE9 && !memcmp(site + 5, kMsgLookupBytes + 5, sizeof(kMsgLookupBytes) - 5);
+    if (!seamless && memcmp(site, kMsgLookupBytes, sizeof(kMsgLookupBytes)) != 0) {
+        Log("CoopResync: invasions: the text lookup is not as expected; invaders keep the game's names");
+        return;
+    }
+    MH_STATUS st = MH_CreateHook(site, reinterpret_cast<void*>(&HkMsgLookup), reinterpret_cast<void**>(&s_OrigMsgLookup));
+    if (st == MH_OK) st = MH_EnableHook(site);
+    Log("CoopResync: invasions: name lookup hook %d (%s)", st, seamless ? "after Seamless Co-op's" : "first");
+}
+
+// The dismissal check's lookup (game thread): the ghost owner is present while an invader lives
+static uintptr_t DismissLookup(uintptr_t wcm, int32_t number) {
+    if (number == kGhostOwner) {
+        ULONGLONG last = s_LastInvaderAlive.load();
+        return last && GetTickCount64() - last < kGhostLingerMs ? wcm : 0;
+    }
+    return reinterpret_cast<uintptr_t (*)(uintptr_t, int32_t)>(s_PrevDismissLookup)(wcm, number);
+}
+
+// Point the dismissal check's call at DismissLookup (through a stub within rel32 reach)
+static bool ChainDismissCheck() {
+    uint8_t* site = reinterpret_cast<uint8_t*>(s_Base + DISMISS_CALL);
+    static const uint8_t after[] = { 0x48, 0x85, 0xc0, 0x75, 0x47 };
+    if (site[0] != 0xE8 || memcmp(site + 5, after, sizeof(after)) != 0) return false;
+    s_PrevDismissLookup = reinterpret_cast<uintptr_t>(site) + 5 + *reinterpret_cast<int32_t*>(site + 1);
+    uint8_t* stub = AllocNear(reinterpret_cast<uintptr_t>(site), 64);
+    if (!stub) return false;
+    uint8_t code[] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };  // mov rax, DismissLookup; jmp rax
+    uintptr_t target = reinterpret_cast<uintptr_t>(&DismissLookup);
+    memcpy(code + 2, &target, 8);
+    memcpy(stub, code, sizeof(code));
+    int64_t rel = reinterpret_cast<int64_t>(stub) - (reinterpret_cast<int64_t>(site) + 5);
+    if (rel != static_cast<int32_t>(rel)) return false;
+    DWORD prot;
+    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &prot)) return false;
+    int32_t rel32 = static_cast<int32_t>(rel);
+    memcpy(site + 1, &rel32, 4);
+    VirtualProtect(site, 5, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    Log("CoopResync: invasions: dismissal check chained (was %llX)", (unsigned long long)s_PrevDismissLookup);
+    return true;
+}
+
+// Invaders.txt: <buddy> <npc> <level from> <to> <style> | <title>;  InvaderNames.txt: one per line
+static void LoadInvaders() {
+    char path[MAX_PATH];
+    char line[512];
+    GameTextures::PathNextToDll("Invaders.txt", path, sizeof(path));
+    if (FILE* f = fopen(path, "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            InvaderEntry e;
+            char style[64] = {};
+            int used = 0;
+            if (sscanf(line, "scaling %d %d %d", &s_ScaleBase, &s_ScaleStep, &s_ScaleLast) == 3) continue;
+            if (line[0] == '#' || sscanf(line, "%d %d %d %d %d %d %63s | %n", &e.buddy, &e.npc, &e.chara, &e.levelMin,
+                                         &e.levelMax, &e.level, style, &used) < 7 || !used)
+                continue;
+            e.style = style;
+            e.title = line + used;
+            while (!e.title.empty() && (e.title.back() == '\n' || e.title.back() == '\r')) e.title.pop_back();
+            s_InvaderList.push_back(e);
+        }
+        fclose(f);
+    }
+    GameTextures::PathNextToDll("InvaderNames.txt", path, sizeof(path));
+    if (FILE* f = fopen(path, "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            std::string n = line;
+            while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
+            if (!n.empty() && n[0] != '#') s_InvaderNames.push_back(n);
+        }
+        fclose(f);
+    }
+    GameTextures::PathNextToDll("InvaderArmor.txt", path, sizeof(path));
+    if (FILE* f = fopen(path, "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            int slot = -1, id = 0, used = 0;
+            if (line[0] == '#' || sscanf(line, "%d %d %n", &slot, &id, &used) < 2 || slot < 0 || slot > 3) continue;
+            std::string name = line + used;
+            while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+            s_Armor[slot].push_back({ id, name });
+        }
+        fclose(f);
+    }
+    GameTextures::PathNextToDll("InvaderLoot.txt", path, sizeof(path));
+    if (FILE* f = fopen(path, "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            char kind[16] = {};
+            unsigned id = 0;
+            int count = 1, used = 0;
+            if (line[0] == '#' || sscanf(line, "%15s %u %d %n", kind, &id, &count, &used) < 3 || !used) continue;
+            uint32_t bits = !strcmp(kind, "armor") ? 0x10000000u : !strcmp(kind, "talisman") ? 0x20000000u
+                          : !strcmp(kind, "goods") ? 0x40000000u : !strcmp(kind, "ash") ? 0x80000000u : 0u;
+            std::string name = line + used;
+            while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+            s_Loot.push_back({ bits | id, count, name });
+        }
+        fclose(f);
+    }
+    GameTextures::PathNextToDll("Invasions.ini", path, sizeof(path));
+    if (FILE* f = fopen(path, "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            char key[64];
+            float v;
+            if (sscanf(line, " %63[a-z_] = %f", key, &v) != 2) continue;
+            if (!strcmp(key, "auto")) s_Inv.autoOn = v != 0;
+            else if (!strcmp(key, "check_seconds")) s_Inv.checkSeconds = (int)v;
+            else if (!strcmp(key, "guarantee_minutes")) s_Inv.guaranteeMinutes = v;
+            else if (!strcmp(key, "ramp_power")) s_Inv.rampPower = v;
+            else if (!strcmp(key, "loot_chance")) s_Inv.lootChance = (int)v;
+            else if (!strcmp(key, "arrive_min")) s_Inv.arriveMin = v;
+            else if (!strcmp(key, "arrive_max")) s_Inv.arriveMax = v;
+            else if (!strcmp(key, "look")) s_Inv.look = (int)v;
+            else if (!strcmp(key, "random_armor")) s_Inv.randomArmor = v != 0;
+            else if (!strcmp(key, "level_margin")) s_Inv.levelMargin = (int)v;
+        }
+        fclose(f);
+    }
+    Log("CoopResync: invasions: %zu invaders, %zu names, %zu loot items, armor %zu/%zu/%zu/%zu; auto %d every %ds, certain "
+        "after %.0f min (power %.1f), loot %d%%, arrive %.0f-%.0f m, look %d, random armor %d, level margin %d, scaling %d "
+        "step %d to %d", s_InvaderList.size(), s_InvaderNames.size(), s_Loot.size(), s_Armor[0].size(), s_Armor[1].size(),
+        s_Armor[2].size(), s_Armor[3].size(), s_Inv.autoOn, s_Inv.checkSeconds, s_Inv.guaranteeMinutes, s_Inv.rampPower,
+        s_Inv.lootChance, s_Inv.arriveMin, s_Inv.arriveMax, s_Inv.look, s_Inv.randomArmor, s_Inv.levelMargin, s_ScaleBase,
+        s_ScaleStep, s_ScaleLast);
+    for (const InvaderEntry& e : s_InvaderList) SetInvaderName(e.npc, e.title);
+}
+
+static void ShowReward(const std::string& text) {
+    std::lock_guard<std::mutex> lock(s_Lock);
+    s_RewardText = text;
+    s_RewardAt = GetTickCount64();
+}
+
+// The host's path, every half second, leaving out samples that rose or fell more than 1.5 m since the one
+// before (jumping, falling, riding a lift)
+static void RecordTrail(uintptr_t main, ULONGLONG now) {
+    if (now < s_NextTrail || !main || Hp(main) <= 0) return;
+    s_NextTrail = now + 500;
+    TrailPoint t = { Rd<uint32_t>(main + 0x6d0), {}, now };
+    for (int i = 0; i < 3; i++) t.p[i] = Rd<float>(main + 0x6c0 + 4 * i);
+    t.p[3] = 1.0f;
+    bool steady = s_LastSample.at && s_LastSample.block == t.block && fabsf(s_LastSample.p[1] - t.p[1]) <= 1.5f;
+    s_LastSample = t;
+    if (!steady) return;
+    s_Trail.push_back(t);
+    if (s_Trail.size() > 1200) s_Trail.erase(s_Trail.begin());   // ten minutes
+}
+
+// Where invaders arrive: ground the host walked on (same block, at least 3 s ago), as far as possible within
+// arriveMin-arriveMax metres of the host and at least 15 m from every player; failing that the farthest such spot
+// at least 15 m out. Returns the distance from the host (0 = none: right here). Their AI senses the nearest player
+// from anywhere (generate.py's NpcThinkParam clones), so they come looking.
+static float ArrivalPoint(uintptr_t main, ULONGLONG now, float out[4]) {
+    alignas(16) uint8_t buf[0x20] = {};
+    const float* phys = reinterpret_cast<const float* (*)(uintptr_t, void*)>(Addr(PHYS_POS))(main, buf);
+    if (!phys) return 0;
+    uint32_t block = Rd<uint32_t>(main + 0x6d0);
+    float p[3], offset[3];   // the host's map position; physics = map + offset on this game right now
+    for (int i = 0; i < 3; i++) {
+        p[i] = Rd<float>(main + 0x6c0 + 4 * i);
+        offset[i] = phys[i] - p[i];
+    }
+    std::vector<std::pair<float, float>> players = { { p[0], p[2] } };
+    if (uintptr_t wcm = Global(WORLD_CHR_MAN)) {
+        uint32_t cap = Rd<uint32_t>(wcm + 0x10ee0 + 0x10);
+        uintptr_t entries = Ptr(wcm + 0x10ee0 + 0x18);
+        for (uint32_t i = 0; entries && i < cap && i < 16; i++) {
+            uintptr_t c = Ptr(entries + i * 16);
+            if (!c || c == main || Rd<uint32_t>(c + 0x30) != block) continue;
+            alignas(16) uint8_t cb[0x20] = {};
+            if (const float* q = reinterpret_cast<const float* (*)(uintptr_t, void*)>(Addr(PHYS_POS))(c, cb))
+                players.push_back({ q[0] - offset[0], q[2] - offset[2] });
+        }
+    }
+    const TrailPoint* best = nullptr;
+    const TrailPoint* fallback = nullptr;
+    float bestD = 0, fallbackD = 0;
+    for (const TrailPoint& t : s_Trail) {
+        if (t.block != block || now - t.at < 3000) continue;
+        bool clear = true;
+        for (const auto& pl : players) {
+            float dx = t.p[0] - pl.first, dz = t.p[2] - pl.second;
+            clear &= dx * dx + dz * dz >= 15.0f * 15.0f;
+        }
+        if (!clear) continue;
+        float dx = t.p[0] - p[0], dz = t.p[2] - p[2], d = sqrtf(dx * dx + dz * dz);
+        if (d >= s_Inv.arriveMin && d <= s_Inv.arriveMax && d > bestD) best = &t, bestD = d;
+        if (d <= s_Inv.arriveMax && d > fallbackD) fallback = &t, fallbackD = d;
+    }
+    const TrailPoint* pick = best ? best : fallback;
+    if (!pick) return 0;
+    for (int i = 0; i < 3; i++) out[i] = pick->p[i] + offset[i];
+    out[3] = phys[3];
+    return best ? bestD : fallbackD;
+}
+
+// Roundtable Hold (m11_10), boss fights, loading, dead: no invasion now
+static const char* InvasionBlocked(uintptr_t main) {
+    uintptr_t gm = Global(GAME_MAN), gdm = Global(GAME_DATA_MAN);
+    if (!main) return "not loaded in";
+    if (Hp(main) <= 0) return "dead";
+    if (gm && Rd<uint8_t>(gm + 0x10)) return "loading";
+    if (gdm && Rd<uint8_t>(gdm + 0xc0)) return "boss fight";
+    if ((Rd<uint32_t>(main + 0x6d0) >> 16) == 0x0B0A) return "Roundtable Hold";
+    return nullptr;
+}
+
+static uint32_t Random(uint32_t n) {
+    static uint64_t state = GetTickCount64() ^ reinterpret_cast<uintptr_t>(&state);
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    return n ? static_cast<uint32_t>((state >> 33) % n) : 0;
+}
+
+static bool IsInvader(uintptr_t chr) {
+    int32_t npc = Rd<int32_t>(chr + 0x60);
+    return npc >= kInvaderNpcFirst && npc <= kInvaderNpcLast;
+}
+
+// Invader characters in the buddy ChrSet (WorldChrMan+0x10f90)
+static std::vector<uintptr_t> InvaderChrs() {
+    std::vector<uintptr_t> out;
+    uintptr_t wcm = Global(WORLD_CHR_MAN);
+    if (!wcm) return out;
+    uint32_t cap = Rd<uint32_t>(wcm + 0x10f90 + 0x10);
+    uintptr_t entries = Ptr(wcm + 0x10f90 + 0x18);
+    for (uint32_t i = 0; entries && i < cap && i < 1000; i++) {
+        uintptr_t chr = Ptr(entries + i * 16);
+        if (chr && IsInvader(chr)) out.push_back(chr);
+    }
+    return out;
+}
+
+static ActiveInvader* ActiveByHandle(uint64_t handle) {
+    for (ActiveInvader& a : s_Active)
+        if (a.handle == handle) return &a;
+    return nullptr;
+}
+
+static void ShowBanner(const std::string& name, const std::string& title) {
+    std::lock_guard<std::mutex> lock(s_Lock);
+    s_BannerName = name;
+    s_BannerTitle = title;
+    s_BannerAt = GetTickCount64();
+}
+
+static void SendInvader(const ActiveInvader& a) {
+    void* net = LinkOk() ? s_NetMessages() : nullptr;
+    if (!net) return;
+    InvaderMsg msg = {};
+    msg.magic = kInvaderMagic;
+    msg.version = 2;
+    msg.bucket = static_cast<uint16_t>(a.bucket < 0 ? 0 : a.bucket);
+    msg.handle = a.handle;
+    strncpy(msg.name, a.name.c_str(), sizeof(msg.name) - 1);
+    strncpy(msg.title, a.title.c_str(), sizeof(msg.title) - 1);
+    for (const Member& m : Members()) {
+        if (m.isLocal || !m.steamId) continue;
+        SteamIdentity to = { 16, 8, m.steamId, {} };
+        s_Send(net, &to, &msg, sizeof(msg), 32, kLinkChannel);
+    }
+}
+
+// A build's CharaInitParam row in this game's memory (0 if the table isn't as expected)
+static uintptr_t CharaRow(int32_t id) {
+    uintptr_t repo = Global(SOLO_PARAM_REPO);
+    if (!repo || !Rd<uint32_t>(repo + 0x80 + kCharaInitTable * 0x48)) return 0;
+    uintptr_t cap = Ptr(repo + 0x88 + kCharaInitTable * 0x48);
+    uintptr_t name = cap ? Ptr(cap + 0x18) : 0;
+    if (!name || wcscmp(reinterpret_cast<const wchar_t*>(name), L"CharaInitParam") != 0) return 0;
+    uintptr_t file = Ptr(Ptr(cap + 0x80) + 0x80);
+    if (!file) return 0;
+    int rows = Rd<uint16_t>(file + 0xa);
+    for (int lo = 0, hi = rows - 1; lo <= hi;) {
+        int mid = (lo + hi) / 2;
+        int32_t rid = Rd<int32_t>(file + 0x40 + mid * 0x18);
+        if (rid == id) return file + Rd<uint64_t>(file + 0x48 + mid * 0x18);
+        if (rid < id) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return 0;
+}
+
+static bool DressRow(int32_t chara, const int32_t armor[4]) {
+    uintptr_t row = CharaRow(chara);
+    if (!row) return false;
+    for (int i = 0; i < 4; i++) *reinterpret_cast<volatile int32_t*>(row + kArmorFields[i]) = armor[i];
+    return true;
+}
+
+static void SendArmor(int32_t chara, const int32_t armor[4]) {
+    void* net = LinkOk() ? s_NetMessages() : nullptr;
+    if (!net) return;
+    ArmorMsg msg = {};
+    msg.magic = kArmorMagic;
+    msg.version = 1;
+    msg.chara = chara;
+    memcpy(msg.armor, armor, sizeof(msg.armor));
+    for (const Member& m : Members()) {
+        if (m.isLocal || !m.steamId) continue;
+        SteamIdentity to = { 16, 8, m.steamId, {} };
+        s_Send(net, &to, &msg, sizeof(msg), 8 | 32, kLinkChannel);   // reliable
+    }
+}
+
+static void OnLinkMessage(uint64_t from, const uint8_t* data, int size, ULONGLONG now) {
+    if (size == (int)sizeof(ArmorMsg)) {
+        ArmorMsg am;
+        memcpy(&am, data, sizeof(am));
+        if (am.magic != kArmorMagic || am.version != 1) return;
+        bool ok = am.chara >= 3910000 && am.chara <= 3919999 && DressRow(am.chara, am.armor);
+        Log("CoopResync: invasions: %llX dresses %d in %d/%d/%d/%d: %s", (unsigned long long)from, am.chara, am.armor[0],
+            am.armor[1], am.armor[2], am.armor[3], ok ? "done" : "NOT done");
+        return;
+    }
+    InvaderMsg msg;
+    if (size != (int)sizeof(msg)) return;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.magic != kInvaderMagic || (msg.version != 1 && msg.version != 2)) return;
+    msg.name[sizeof(msg.name) - 1] = 0;
+    msg.title[sizeof(msg.title) - 1] = 0;
+    ActiveInvader* a = ActiveByHandle(msg.handle);
+    if (a && a->named) return;
+    if (!a) {
+        s_Active.push_back({ msg.handle, "", "", now, 0, 0 });
+        a = &s_Active.back();
+    }
+    a->name = msg.name;
+    a->title = msg.title;
+    a->named = true;
+    a->bucket = msg.version >= 2 ? msg.bucket : 0;
+    Log("CoopResync: invasions: %llX says %llX is %s (%s), level step %d", (unsigned long long)from,
+        (unsigned long long)msg.handle, msg.name, msg.title, a->bucket);
+    ShowBanner(msg.name, msg.title);
+}
+
+static bool CallSummon(uintptr_t man) {
+    __try {
+        reinterpret_cast<void (*)(uintptr_t)>(Addr(SUMMON_REQUEST))(man);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Host (or solo): pick one invader for the host's level, dress its row in random armor on every game (the
+// others are told first and the summon waits a moment, as each game builds its copy from its own row)
+static void SummonInvader(ULONGLONG now, bool automatic) {
+    int lobby = LobbyState();
+    uintptr_t main = MainPlayer(), wcm = Global(WORLD_CHR_MAN);
+    uintptr_t man = wcm ? Ptr(wcm + 0x1e538) : 0;
+    uintptr_t pgd = main ? Ptr(main + 0x580) : 0;
+    if (!s_InvasionsOk || !man || !pgd || !Intact(SUMMON_REQUEST, true)) return SetMessage("Invasions aren't available");
+    if (lobby == 6) return SetMessage("Only the host can summon invaders");
+    if (s_Pending.on) return SetMessage("An invader is on the way");
+    if (const char* why = InvasionBlocked(main)) return SetMessage(std::string("No invasion now: ") + why);
+    int level = Rd<int32_t>(pgd + 0x68);
+    std::vector<const InvaderEntry*> fit;
+    for (const InvaderEntry& e : s_InvaderList)
+        if (level >= e.levelMin && level <= e.levelMax && e.level <= level + s_Inv.levelMargin) fit.push_back(&e);
+    if (fit.empty()) return SetMessage("No invader fits your level");
+    const InvaderEntry& pick = *fit[Random((uint32_t)fit.size())];
+    s_Pending.on = true;
+    s_Pending.pick = &pick;
+    s_Pending.name = s_InvaderNames.empty() ? pick.title : s_InvaderNames[Random((uint32_t)s_InvaderNames.size())];
+    s_Pending.bucket = s_ScaleStep > 0 ? (std::min)((std::max)(level - pick.level, 0) / s_ScaleStep, s_ScaleLast) : 0;
+    s_Pending.automatic = automatic;
+    s_Pending.at = now;
+    bool others = InSession(lobby) && Members().size() > 1;
+    if (s_Inv.randomArmor && s_Armor[0].size() && s_Armor[1].size() && s_Armor[2].size() && s_Armor[3].size()) {
+        int32_t armor[4];
+        std::string names;
+        for (int i = 0; i < 4; i++) {
+            const ArmorPiece& a = s_Armor[i][Random((uint32_t)s_Armor[i].size())];
+            armor[i] = a.id;
+            names += (i ? ", " : "") + a.name;
+        }
+        bool dressed = DressRow(pick.chara, armor);
+        if (others) {
+            SendArmor(pick.chara, armor);
+            s_Pending.at = now + kArmorLeadMs;
+        }
+        Log("CoopResync: invasions: %s dressed in %s%s", pick.title.c_str(), names.c_str(), dressed ? "" : " (row NOT found)");
+    }
+}
+
+static void SummonPending(ULONGLONG now) {
+    PendingInvasion p = s_Pending;
+    s_Pending = {};
+    uintptr_t main = MainPlayer(), wcm = Global(WORLD_CHR_MAN);
+    uintptr_t man = wcm ? Ptr(wcm + 0x1e538) : 0;
+    uintptr_t pgd = main ? Ptr(main + 0x580) : 0;
+    if (!man || !pgd) return SetMessage("Invasions aren't available");
+    if (const char* why = InvasionBlocked(main)) return SetMessage(std::string("No invasion now: ") + why);
+    const InvaderEntry& pick = *p.pick;
+    const std::string& name = p.name;
+    bool automatic = p.automatic;
+    int level = Rd<int32_t>(pgd + 0x68);
+
+    alignas(16) uint8_t buf[0x20] = {};
+    const float* phys = reinterpret_cast<const float* (*)(uintptr_t, void*)>(Addr(PHYS_POS))(main, buf);
+    alignas(16) uint8_t rbuf[0x20] = {};
+    const float* rot = reinterpret_cast<const float* (*)(uintptr_t, void*)>(Addr(ROTATION))(main, rbuf);
+    if (!phys || !rot) return SetMessage("Couldn't tell where you are");
+    std::vector<uint64_t> before;
+    for (uintptr_t c : InvaderChrs()) before.push_back(Rd<uint64_t>(c + 8));
+
+    // they arrive a little way back along the host's path (or right here if there's no such spot)
+    alignas(16) float origin[4] = { phys[0], phys[1], phys[2], phys[3] };
+    float away = ArrivalPoint(main, now, origin);
+    // the summon manager summons for the main player: give it the ghost's number for this one call
+    int32_t number = Rd<int32_t>(pgd + 8), req = Rd<int32_t>(man + 0x20), active = Rd<int32_t>(man + 0x24);
+    memcpy(reinterpret_cast<void*>(man + 0xa0), origin, sizeof(origin));
+    *reinterpret_cast<volatile float*>(man + 0xb0) = rot[1];
+    *reinterpret_cast<volatile int32_t*>(man + 0x20) = pick.buddy;
+    *reinterpret_cast<volatile int32_t*>(pgd + 8) = kGhostOwner;
+    bool ok = CallSummon(man);
+    *reinterpret_cast<volatile int32_t*>(pgd + 8) = number;
+    *reinterpret_cast<volatile int32_t*>(man + 0x20) = req;
+    *reinterpret_cast<volatile int32_t*>(man + 0x24) = active;
+    s_LastInvaderAlive = now;
+    if (!ok) return SetMessage("The summon failed (see the log)");
+
+    int found = 0;
+    for (uintptr_t c : InvaderChrs()) {
+        uint64_t h = Rd<uint64_t>(c + 8);
+        bool old = false;
+        for (uint64_t b : before) old |= b == h;
+        if (old || ActiveByHandle(h)) continue;
+        *reinterpret_cast<volatile uint8_t*>(c + 0x6c) = kInvaderTeam;
+        ActiveInvader a = { h, name, pick.title, now, 3, now };
+        a.own = true;
+        a.named = true;
+        a.bucket = p.bucket;
+        s_Active.push_back(a);
+        found++;
+    }
+    s_LastInvasion = now;
+    Log("CoopResync: invasions: %s %s (%s, buddy %d, invader level %d, host level %d, catch-up step %d, %s): %d character(s)",
+        automatic ? "automatic" : "summoned", name.c_str(), pick.title.c_str(), pick.buddy, pick.level, level, p.bucket,
+        away > 0 ? (std::to_string((int)away) + " m away").c_str() : "right here", found);
+    if (!found) return SetMessage("The summon made no invader (see the log)");
+    ShowBanner(name, pick.title);
+    SetMessage("Invaded by " + name + "!");
+}
+
+struct PhantomSpec {
+    uint32_t unk0;
+    int32_t phantomParam;
+    float unk8;
+    uint8_t unkc[4];
+};
+
+static bool CallPhantomApply(uintptr_t modifiers, const PhantomSpec* spec) {
+    __try {
+        reinterpret_cast<void (*)(uintptr_t, const PhantomSpec*, uint8_t)>(Addr(PHANTOM_APPLY))(modifiers, spec, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void PaintInvader(uintptr_t c, ActiveInvader& a, int phantom) {
+    if (Rd<int32_t>(c + 0x540) != phantom) *reinterpret_cast<volatile int32_t*>(c + 0x540) = phantom;
+    bool painted = false;
+    if (!a.own && Intact(PHANTOM_APPLY, true)) {
+        uintptr_t mods = Ptr(c + 0x190);
+        uintptr_t modifiers = mods ? Ptr(mods + 0xd0) : 0;
+        PhantomSpec spec = { 0, phantom, 0.0f, {} };
+        painted = modifiers && CallPhantomApply(modifiers, &spec);
+    }
+    if (!a.looked) {
+        a.looked = true;
+        Log("CoopResync: invasions: %s in PhantomParam %d (%s; npc %d, team %d)", a.name.c_str(), phantom,
+            a.own ? "ours: phantom override" : painted ? "another game's: painted" : "another game's: NOT painted",
+            Rd<int32_t>(c + 0x60), Rd<uint8_t>(c + 0x6c));
+    }
+}
+
+// Every game, every frame: invaders hostile, scaled to the party, in the invader look and named; the
+// summoner's game keeps the ghost owner present while one lives; announcements go out a few times
+// (messages are unreliable); each game rolls its player's loot when an invader dies; the host's game
+// runs the automatic invasions; invaders gone for a while are forgotten
+static void InvasionFrame(ULONGLONG now) {
+    int lobby = LobbyState();
+    uintptr_t main = MainPlayer();
+    int party = InSession(lobby) ? (int)Members().size() : 1;
+    if (!s_NameHookTried && main) HookNames();
+    if (uint32_t c = s_NewNameCategory.exchange(0)) Log("CoopResync: invasions: invader names answered in text category %u", c - 1);
+    RecordTrail(main, now);
+    std::vector<InvaderView> view;
+    bool alive = false;
+    for (uintptr_t c : InvaderChrs()) {
+        if (Rd<uint8_t>(c + 0x6c) != kInvaderTeam) *reinterpret_cast<volatile uint8_t*>(c + 0x6c) = kInvaderTeam;
+        uint64_t h = Rd<uint64_t>(c + 8);
+        ActiveInvader* a = ActiveByHandle(h);
+        if (!a) {
+            s_Active.push_back({ h, "Tarnished", "", now, 0, 0 });
+            a = &s_Active.back();
+        }
+        a->seen = now;
+        if (a->named && !a->nameShown) {
+            SetInvaderName(Rd<int32_t>(c + 0x60), a->name);
+            a->nameShown = true;
+        }
+        int hp = Hp(c);
+        uintptr_t mods = Ptr(c + 0x190);
+        uintptr_t data = mods ? Ptr(mods) : 0;
+        int maxHp = data ? Rd<int32_t>(data + 0x13c) : 0;
+        if (hp > 0) {
+            alive = true;
+            s_LastInvaderAlive = now;
+            if (s_Inv.look > 0) PaintInvader(c, *a, s_Inv.look);
+            // toughness = party size x level catch-up; another game's invader waits up to 3 s for its step
+            if (!a->since) a->since = now;
+            int bucket = a->bucket >= 0 ? a->bucket : now - a->since > 3000 ? 0 : -1;
+            int32_t want = s_ScaleBase && bucket >= 0 ? s_ScaleBase + 1000 * (std::min)(party, 6) + (std::min)(bucket, s_ScaleLast) : 0;
+            if (want && want != a->scaledId && Intact(APPLY_SPEFFECT, true) && Intact(REMOVE_SPEFFECT, true)) {
+                if (a->scaledId) reinterpret_cast<void (*)(uintptr_t, int32_t)>(Addr(REMOVE_SPEFFECT))(c, a->scaledId);
+                reinterpret_cast<uint64_t (*)(uintptr_t, int32_t, uint8_t)>(Addr(APPLY_SPEFFECT))(c, want, 1);
+                Log("CoopResync: invasions: %s scaled for %d player(s), level step %d (SpEffect %d)", a->name.c_str(), party,
+                    bucket, want);
+                a->scaledId = want;
+                if (a->own) a->topUpAt = now + 500;
+            }
+            if (a->topUpAt && now >= a->topUpAt && data) {
+                *reinterpret_cast<volatile int32_t*>(data + 0x138) = maxHp;
+                a->topUpAt = 0;
+            }
+        } else if (!a->rewarded) {
+            a->rewarded = true;
+            if (!s_Loot.empty() && (int)Random(100) < s_Inv.lootChance) {
+                const LootItem& item = s_Loot[Random((uint32_t)s_Loot.size())];
+                bool given = ConvenienceMenu::GiveItem(item.id, item.count);
+                Log("CoopResync: invasions: %s defeated; loot %s x%d (%08X) %s", a->name.c_str(), item.name.c_str(), item.count,
+                    item.id, given ? "given" : "NOT given");
+                if (given) ShowReward(item.count > 1 ? item.name + " x" + std::to_string(item.count) : item.name);
+            } else {
+                // Consolation: Golden Rune [1]-[13] (goods 2900-2912), each step up 70% as likely as the last
+                int n = 1;
+                while (n < 13 && Random(100) < 70) n++;
+                std::string rune = "Golden Rune [" + std::to_string(n) + "]";
+                bool given = ConvenienceMenu::GiveItem(0x40000000u + 2899 + n, 1);
+                Log("CoopResync: invasions: %s defeated; no loot roll, consolation %s %s", a->name.c_str(), rune.c_str(),
+                    given ? "given" : "NOT given");
+                if (given) ShowReward(rune);
+            }
+        }
+        view.push_back({ a->name, a->title, hp, maxHp });
+    }
+    for (ActiveInvader& a : s_Active) {
+        if (a.sends > 0 && now >= a.nextSend) {
+            SendInvader(a);
+            a.sends--;
+            a.nextSend = now + 1000;
+        }
+    }
+    for (size_t i = 0; i < s_Active.size();)
+        if (now - s_Active[i].seen > 30000) s_Active.erase(s_Active.begin() + i);
+        else i++;
+
+    // automatic invasions: the host (or a solo player) rolls every checkSeconds; the chance climbs
+    // from 0 to certain over guaranteeMinutes since the last invasion
+    if (s_Inv.autoOn && lobby != 6 && main) {
+        if (!s_LastInvasion) s_LastInvasion = now;
+        float minutes = (now - s_LastInvasion) / 60000.0f;
+        s_ChanceNow = fminf(1.0f, powf(minutes / fmaxf(1.0f, s_Inv.guaranteeMinutes), s_Inv.rampPower));
+        if (now >= s_NextCheck) {
+            s_NextCheck = now + (ULONGLONG)fmaxf(5.0f, (float)s_Inv.checkSeconds) * 1000;
+            if (!alive && !s_Pending.on && Random(1000000) < (uint32_t)(s_ChanceNow * 1000000.0f)) {
+                const char* why = InvasionBlocked(main);
+                if (why) Log("CoopResync: invasions: an automatic invasion is due but waits (%s)", why);
+                else SummonInvader(now, true);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(s_Lock);
+    s_InvaderView = std::move(view);
+}
+
 // ---- the per-frame task ----
 
 static ULONGLONG s_NextSnapshot = 0;
@@ -855,6 +1664,11 @@ static void RunFrame() {
     if (s_WantResync.exchange(false)) StartResync(now);
     if (s_WantReload.exchange(false)) ReloadHere();
     if (s_WantHost.exchange(false)) GoToHost(now);
+    if (s_InvasionsOk) {
+        if (s_WantInvader.exchange(false)) SummonInvader(now, false);
+        if (s_Pending.on && now >= s_Pending.at) SummonPending(now);
+        InvasionFrame(now);
+    }
     if (s_FollowUpAt && now >= s_FollowUpAt) {
         s_FollowUpAt = 0;
         FollowUp(now);
@@ -905,6 +1719,9 @@ void Init() {
     s_SpotOk = Intact(REF_BLOCK, true) && Intact(PHYS_POS, true) && Intact(TO_BLOCK_POS, true) && Intact(ROTATION, true) && Intact(NORM_BLOCK, true);
     s_HostSpotOk = Intact(HOST_SPOT_GETTER, false) && Intact(HOST_SPOT_READER, false);
     ResolveLink();
+    LoadInvaders();
+    s_InvasionsOk = !s_InvaderList.empty() && s_SpotOk && Intact(SUMMON_REQUEST, true) && ChainDismissCheck();
+    if (!s_InvaderList.empty() && !s_InvasionsOk) Log("CoopResync: invasions: the summon or dismissal code is not as expected; off");
     if (Intact(MEMBER_LEFT, false)) {
         void* target = reinterpret_cast<void*>(Addr(MEMBER_LEFT));
         MH_STATUS st = MH_CreateHook(target, reinterpret_cast<void*>(&HkMemberLeft), reinterpret_cast<void**>(&s_OrigMemberLeft));
@@ -939,12 +1756,16 @@ void StartTask() {
 
 void DrawMenuSection(float scale) {
     std::vector<MemberView> view;
+    std::vector<InvaderView> invaders;
     int lobby;
+    bool inGame;
     std::string message;
     {
         std::lock_guard<std::mutex> lock(s_Lock);
         view = s_View;
+        invaders = s_InvaderView;
         lobby = s_ViewLobby;
+        inGame = s_ViewInGame;
         if (s_MessageAt && GetTickCount64() - s_MessageAt < 10000) message = s_Message;
     }
 
@@ -1016,8 +1837,89 @@ void DrawMenuSection(float scale) {
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Loading screen, then you're next to the host");
     }
+
+    // Invasions: the host (or a solo player) summons; everyone sees the list
+    if (s_InvasionsOk && running && inGame) {
+        ImGui::Spacing();
+        ImGui::TextColored(gold, "Invasions");
+        ImGui::Separator();
+        for (const InvaderView& v : invaders) {
+            ImGui::Text("%s", v.name.c_str());
+            if (!v.title.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", v.title.c_str());
+            }
+            char hp[32];
+            if (v.hp > 0) snprintf(hp, sizeof(hp), "%d / %d", v.hp, v.maxHp);
+            else snprintf(hp, sizeof(hp), "defeated");
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::CalcTextSize(hp).x);
+            ImGui::TextColored(v.hp > 0 ? ImVec4(0.90f, 0.40f, 0.35f, 1.0f) : ImVec4(0.62f, 0.78f, 0.52f, 1.0f), "%s", hp);
+        }
+        if (lobby == 6) {
+            ImGui::TextDisabled("The host summons invaders");
+        } else {
+            if (ImGui::Button("Summon invader", ImVec2(w, 0))) s_WantInvader = true;
+            if (s_Inv.autoOn) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("automatic: %.1f%% a roll now", s_ChanceNow * 100.0f);
+            }
+        }
+    }
     if (!message.empty()) ImGui::TextWrapped("%s", message.c_str());
     ImGui::Spacing();
+}
+
+void DrawBanner(ImFont* font) {
+    std::string name, title;
+    ULONGLONG at;
+    {
+        std::lock_guard<std::mutex> lock(s_Lock);
+        name = s_BannerName;
+        title = s_BannerTitle;
+        at = s_BannerAt;
+    }
+    std::string reward;
+    ULONGLONG rewardAt;
+    {
+        std::lock_guard<std::mutex> lock(s_Lock);
+        reward = s_RewardText;
+        rewardAt = s_RewardAt;
+    }
+    ImGuiIO& rio = ImGui::GetIO();
+    ImFont* rf = font ? font : ImGui::GetFont();
+    ULONGLONG rage = rewardAt ? GetTickCount64() - rewardAt : 0;
+    if (rewardAt && rage < 5000) {
+        float ra = rage < 300 ? rage / 300.0f : rage > 4000 ? (5000 - rage) / 1000.0f : 1.0f;
+        float size = floorf(30.0f * rio.DisplaySize.y / 1080.0f);
+        std::string text = "Spoils: " + reward;
+        ImVec2 ts = rf->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+        ImVec2 pos(floorf(rio.DisplaySize.x * 0.5f - ts.x * 0.5f), rio.DisplaySize.y * 0.40f);
+        ImDrawList* rdl = ImGui::GetForegroundDrawList();
+        rdl->AddText(rf, size, ImVec2(pos.x + 2.0f, pos.y + 2.0f), IM_COL32(0, 0, 0, (int)(ra * 255)), text.c_str());
+        rdl->AddText(rf, size, pos, IM_COL32(222, 196, 120, (int)(ra * 255)), text.c_str());
+    }
+    ULONGLONG age = at ? GetTickCount64() - at : 0;
+    if (!at || age > 5000) return;
+    float alpha = age < 300 ? age / 300.0f : age > 4000 ? (5000 - age) / 1000.0f : 1.0f;
+    ImGuiIO& io = ImGui::GetIO();
+    float scale = io.DisplaySize.y / 1080.0f;
+    ImFont* f = font ? font : ImGui::GetFont();
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    std::string line = "Invaded by " + name + "!";
+    float bigSize = floorf(46.0f * scale), titleSize = floorf(24.0f * scale);
+    ImVec2 s1 = f->CalcTextSizeA(bigSize, FLT_MAX, 0.0f, line.c_str());
+    ImVec2 s2 = f->CalcTextSizeA(titleSize, FLT_MAX, 0.0f, title.c_str());
+    float y = io.DisplaySize.y * 0.26f;
+    float bandH = s1.y + (title.empty() ? 0.0f : s2.y + 6.0f * scale) + 28.0f * scale;
+    int a = (int)(alpha * 255.0f);
+    dl->AddRectFilled(ImVec2(0, y - 14.0f * scale), ImVec2(io.DisplaySize.x, y - 14.0f * scale + bandH), IM_COL32(0, 0, 0, a * 150 / 255));
+    ImVec2 p1(floorf(io.DisplaySize.x * 0.5f - s1.x * 0.5f), y);
+    dl->AddText(f, bigSize, ImVec2(p1.x + 2.0f, p1.y + 2.0f), IM_COL32(0, 0, 0, a), line.c_str());
+    dl->AddText(f, bigSize, p1, IM_COL32(205, 60, 50, a), line.c_str());
+    if (!title.empty()) {
+        ImVec2 p2(floorf(io.DisplaySize.x * 0.5f - s2.x * 0.5f), y + s1.y + 6.0f * scale);
+        dl->AddText(f, titleSize, p2, IM_COL32(200, 188, 150, a), title.c_str());
+    }
 }
 
 } // namespace CoopResync
