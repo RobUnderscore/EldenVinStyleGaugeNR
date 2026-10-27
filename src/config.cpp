@@ -103,6 +103,17 @@ static void WriteDefaultConfig(const char* path) {
     fprintf(f, "showBar = 1\n");
     fprintf(f, "showLabels = 1\n");
     fprintf(f, "showBorder = 0\n");
+    fprintf(f, "\n");
+    fprintf(f, "# Buff timers (Elden Ring): your timed buffs' icons with the time left under each.\n");
+    fprintf(f, "# buffPosX/buffPosY = top-left corner (F7 to drag), buffScale 1.0 = 34px icons at 1080p,\n");
+    fprintf(f, "# buffMinDuration hides effects shorter than that many seconds in total.\n");
+    fprintf(f, "buffTimers = 1\n");
+    fprintf(f, "buffPosX = 0.052\n");
+    fprintf(f, "buffPosY = 0.135\n");
+    fprintf(f, "buffScale = 1.0\n");
+    fprintf(f, "buffPerRow = 10\n");
+    fprintf(f, "buffMinDuration = 3\n");
+    fprintf(f, "buffOpacity = 0.95\n");
     fclose(f);
 }
 
@@ -121,6 +132,13 @@ static GaugeConfig LoadFrom(const char* path) {
     cfg.showBar = ReadBool(f, "showBar", cfg.showBar);
     cfg.showLabels = ReadBool(f, "showLabels", cfg.showLabels);
     cfg.showBorder = ReadBool(f, "showBorder", cfg.showBorder);
+    cfg.buffTimers = ReadBool(f, "buffTimers", cfg.buffTimers);
+    cfg.buffPosX = ReadFloat(f, "buffPosX", cfg.buffPosX);
+    cfg.buffPosY = ReadFloat(f, "buffPosY", cfg.buffPosY);
+    cfg.buffScale = ReadFloat(f, "buffScale", cfg.buffScale);
+    cfg.buffPerRow = ReadFloat(f, "buffPerRow", cfg.buffPerRow);
+    cfg.buffMinDuration = ReadFloat(f, "buffMinDuration", cfg.buffMinDuration);
+    cfg.buffOpacity = ReadFloat(f, "buffOpacity", cfg.buffOpacity);
     fclose(f);
     return cfg;
 }
@@ -172,6 +190,13 @@ void Save(const GaugeConfig& cfg) {
     fprintf(f, "showBar = %d\n", cfg.showBar ? 1 : 0);
     fprintf(f, "showLabels = %d\n", cfg.showLabels ? 1 : 0);
     fprintf(f, "showBorder = %d\n", cfg.showBorder ? 1 : 0);
+    fprintf(f, "buffTimers = %d\n", cfg.buffTimers ? 1 : 0);
+    fprintf(f, "buffPosX = %.4f\n", cfg.buffPosX);
+    fprintf(f, "buffPosY = %.4f\n", cfg.buffPosY);
+    fprintf(f, "buffScale = %.2f\n", cfg.buffScale);
+    fprintf(f, "buffPerRow = %.0f\n", cfg.buffPerRow);
+    fprintf(f, "buffMinDuration = %.1f\n", cfg.buffMinDuration);
+    fprintf(f, "buffOpacity = %.2f\n", cfg.buffOpacity);
     fclose(f);
 
     Log("Config: saved position (%.4f, %.4f) to %s", cfg.posX, cfg.posY, path);

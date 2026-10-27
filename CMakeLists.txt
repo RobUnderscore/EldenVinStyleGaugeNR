@@ -41,6 +41,8 @@ add_library(VinStyleRankGauge SHARED
     src/overlay.cpp
     src/config.cpp
     src/game_textures.cpp
+    src/buff_timers.cpp
+    src/convenience_menu.cpp
 )
 
 target_link_libraries(VinStyleRankGauge PRIVATE

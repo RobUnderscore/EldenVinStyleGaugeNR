@@ -17,6 +17,15 @@ struct GaugeConfig {
     bool showBar = true;
     bool showLabels = true;
     bool showBorder = false;
+
+    // Buff timers (Elden Ring): icons of timed buffs with the time left under each
+    bool buffTimers = true;
+    float buffPosX = 0.052f;      // top-left corner of the row, as a fraction of the screen
+    float buffPosY = 0.135f;
+    float buffScale = 1.0f;       // 1.0 = 34px icons at 1080p, scales with resolution
+    float buffPerRow = 10.0f;
+    float buffMinDuration = 3.0f; // hide effects shorter than this many seconds in total
+    float buffOpacity = 0.95f;
 };
 
 namespace Config {

@@ -4,10 +4,13 @@
 #include "d3dhook.h"
 #include "memory.h"
 #include "game_textures.h"
+#include "buff_timers.h"
+#include "convenience_menu.h"
 #include <Windows.h>
 #include <imgui.h>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -19,6 +22,7 @@ static GaugeConfig g_Config;
 static bool g_ConfigLoaded = false;
 static bool g_WasPositionMode = false;
 static bool g_SnapPosition = false;
+static bool g_SnapBuffs = false;
 
 static ImU32 ApplyOpacity(ImU32 color, float opacity) {
     int a = (int)(((color >> 24) & 0xFF) * opacity);
@@ -282,16 +286,51 @@ static const Sprite SPR_DECO   { 0, 0, 2938, 25 };   // MENU_FL_BarDeco: gold li
 static const Sprite SPR_DECO_L { 1362, 397, 46, 38 }; // MENU_FL_BarDeco_L: ornament at the left end
 static const Sprite SPR_REGAIN { 3172, 0, 32, 64 };  // MENU_FL_HP_Regain: soft glow
 
-static std::vector<uint8_t> s_AtlasDds;
+// [0] SB_FE_01 for the bar, then the SB_Status_* sheets with the buff icons
+static constexpr int kMaxSheets = 4;
+static std::vector<uint8_t> s_AtlasDds[kMaxSheets];
 static std::atomic<int> s_AtlasState{ 0 }; // 0 idle, 1 loading, 2 ready to upload, 3 uploaded, -1 unavailable
 static ImTextureID s_Atlas = 0;
 static float s_AtlasW = 1.0f, s_AtlasH = 1.0f;
+static BuffTimers::Sheets s_StatusSheets;
+static std::vector<uint8_t> s_ItemIconsDds;
 
 static DWORD WINAPI LoadAtlasThread(LPVOID) {
     char path[MAX_PATH];
     GameTextures::PathNextToDll("..\\elden-vins\\menu\\hi\\01_common.tpf.dcx", path, sizeof(path));
-    s_AtlasState = GameTextures::LoadDds(path, L"SB_FE_01", s_AtlasDds) ? 2 : -1;
+    const wchar_t* names[kMaxSheets] = { L"SB_FE_01" };
+    int count = 1 + BuffTimers::SheetCount();
+    if (count > kMaxSheets) count = kMaxSheets;
+    for (int i = 1; i < count; i++) names[i] = BuffTimers::SheetName(i - 1);
+    int found = GameTextures::LoadDdsMany(path, names, s_AtlasDds, count);
+
+    // weapon buff icons: a plain DDS next to this DLL (generated, see er-buff-timers/gen_buff_icons.py)
+    GameTextures::PathNextToDll(BuffTimers::ItemIconsFile(), path, sizeof(path));
+    if (FILE* f = fopen(path, "rb")) {
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        s_ItemIconsDds.resize(size > 0 ? size : 0);
+        if (size <= 0 || fread(s_ItemIconsDds.data(), 1, size, f) != (size_t)size) s_ItemIconsDds.clear();
+        fclose(f);
+    }
+    if (s_ItemIconsDds.empty()) Log("Buff timers: can't read %s", path);
+    s_AtlasState = found > 0 ? 2 : -1;
     return 0;
+}
+
+static ImTextureID Upload(std::vector<uint8_t>& dds, float& w, float& h) {
+    ImTextureID tex = 0;
+    if (dds.size() >= 0x14) {
+        uint32_t dh, dw;
+        memcpy(&dh, dds.data() + 0x0C, 4);
+        memcpy(&dw, dds.data() + 0x10, 4);
+        w = (float)dw;
+        h = (float)dh;
+        tex = D3DHook::CreateTextureFromDds(dds.data(), dds.size());
+    }
+    std::vector<uint8_t>().swap(dds);
+    return tex;
 }
 
 // Load in the background on first use, upload on the render thread once the bytes are ready
@@ -302,16 +341,11 @@ static void UpdateAtlas() {
         HANDLE th = CreateThread(nullptr, 0, LoadAtlasThread, nullptr, 0, nullptr);
         if (th) CloseHandle(th); else s_AtlasState = -1;
     } else if (st == 2) {
-        if (s_AtlasDds.size() >= 0x14) {
-            uint32_t h, w;
-            memcpy(&h, s_AtlasDds.data() + 0x0C, 4);
-            memcpy(&w, s_AtlasDds.data() + 0x10, 4);
-            s_AtlasW = (float)w;
-            s_AtlasH = (float)h;
-        }
-        s_Atlas = D3DHook::CreateTextureFromDds(s_AtlasDds.data(), s_AtlasDds.size());
-        s_AtlasState = s_Atlas ? 3 : -1;
-        std::vector<uint8_t>().swap(s_AtlasDds);
+        s_Atlas = Upload(s_AtlasDds[0], s_AtlasW, s_AtlasH);
+        for (int i = 0; i + 1 < kMaxSheets && i < 4; i++)
+            s_StatusSheets.tex[i] = Upload(s_AtlasDds[i + 1], s_StatusSheets.w[i], s_StatusSheets.h[i]);
+        s_StatusSheets.items = Upload(s_ItemIconsDds, s_StatusSheets.itemsW, s_StatusSheets.itemsH);
+        s_AtlasState = 3; // Blit/buff icons check their own texture
     }
 }
 
@@ -385,11 +419,56 @@ static void DrawUltimateBarSprites(ImDrawList* draw, float x, float y, float w, 
     DrawUltLightning(draw, x, y, w, h, fill, op);
 }
 
+// Buff timers: drawn every frame on their own (the gauge below returns early when idle).
+// In F7 mode the row gets a draggable frame, with sample icons if nothing is active.
+static void DrawBuffTimers(bool posMode) {
+    const Memory::GameLayout* game = Memory::Game();
+    if (!g_Config.buffTimers || !game || strcmp(game->moduleName, "eldenring.exe") != 0) return;
+    UpdateAtlas();
+
+    std::vector<BuffTimers::Buff> buffs = BuffTimers::Update(g_Config.buffMinDuration);
+    if (posMode && buffs.empty()) buffs = BuffTimers::Preview();
+    if (buffs.empty()) return;
+
+    auto& io = ImGui::GetIO();
+    float screenW = io.DisplaySize.x, screenH = io.DisplaySize.y;
+    float scale = screenH / 1080.0f * g_Config.buffScale;
+    int perRow = (int)g_Config.buffPerRow;
+    float x = floorf(screenW * g_Config.buffPosX), y = floorf(screenH * g_Config.buffPosY);
+
+    if (posMode) {
+        ImVec2 size = BuffTimers::Measure(buffs.size(), scale, perRow);
+        if (g_SnapBuffs) {
+            ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+            g_SnapBuffs = false;
+        }
+        ImGui::SetNextWindowSize(ImVec2(size.x + 4, size.y + 4), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(20, 15, 5, 100));
+        ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(255, 180, 50, 200));
+        ImGui::Begin("##BuffTimers", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing);
+        ImVec2 wp = ImGui::GetWindowPos();
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+        x = wp.x + 2; y = wp.y + 2;
+        g_Config.buffPosX = x / screenW;
+        g_Config.buffPosY = y / screenH;
+    }
+
+    BuffTimers::Draw(ImGui::GetForegroundDrawList(), D3DHook::TimerFont(), s_StatusSheets, buffs,
+        x, y, scale, perRow, g_Config.buffOpacity);
+}
+
 static void FinishWindow(bool posMode, float screenW) {
     // Position mode hint
     if (posMode) {
         ImDrawList* bgDraw = ImGui::GetForegroundDrawList();
-        const char* hint = "F7: Drag gauge to reposition. Press F7 again to lock & save.";
+        const char* hint = "F7: Drag the gauge and the buff timers to reposition. Press F7 again to lock & save.";
         ImVec2 hintSize = ImGui::CalcTextSize(hint);
         float hx = (screenW - hintSize.x) * 0.5f;
         bgDraw->AddRectFilled(ImVec2(hx - 8, 8), ImVec2(hx + hintSize.x + 8, 32), IM_COL32(0, 0, 0, 180), 4.0f);
@@ -412,12 +491,17 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     // Detect transitions into/out of position mode
     if (!g_WasPositionMode && posMode) {
         g_SnapPosition = true; // snap window to config pos on entering
+        g_SnapBuffs = true;
     }
     if (g_WasPositionMode && !posMode) {
         Log("Position mode ended, saving config");
         Config::Save(g_Config);
     }
     g_WasPositionMode = posMode;
+
+    DrawBuffTimers(posMode);
+    if (Memory::Game() && strcmp(Memory::Game()->moduleName, "eldenring.exe") == 0)
+        ConvenienceMenu::Draw(D3DHook::TimerFont(), D3DHook::IsMenuOpen());
 
     StyleRankState state = StyleRank::Update();
     int rank = state.rank;
@@ -500,7 +584,7 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
 
     if (ultMode && state.fill >= 0.0f) {
         float bx = wp.x + 20.0f, by = wp.y + (windowH - gh) * 0.5f;
-        if (s_AtlasState == 3) DrawUltimateBarSprites(draw, bx, by, gw, gh, state.fill, op);
+        if (s_AtlasState == 3 && s_Atlas) DrawUltimateBarSprites(draw, bx, by, gw, gh, state.fill, op);
         else DrawUltimateBar(draw, bx, by, gw, gh, state.fill, op);
         FinishWindow(posMode, screenW);
         return;

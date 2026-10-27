@@ -22,7 +22,10 @@ using ExecuteCommandListsFn = void(WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12Com
 static ID3D12Device*                g_Device = nullptr;
 static ID3D12DescriptorHeap*        g_SrvDescHeap = nullptr;
 static ID3D12DescriptorHeap*        g_RtvDescHeap = nullptr;
-static ID3D12Resource*              g_GameTexture = nullptr; // SRV slot 1 (slot 0 is ImGui's font)
+static constexpr int                kMaxGameTextures = 7;
+static ID3D12Resource*              g_GameTextures[kMaxGameTextures] = {}; // SRV slots 1.. (slot 0 is ImGui's font)
+static int                          g_GameTextureCount = 0;
+static ImFont*                      g_TimerFont = nullptr;
 static ID3D12CommandQueue*          g_CommandQueue = nullptr;
 static ID3D12GraphicsCommandList*   g_CommandList = nullptr;
 static std::vector<ID3D12CommandAllocator*> g_CommandAllocators;
@@ -36,6 +39,10 @@ static RenderCallback               g_RenderCallback = nullptr;
 static PresentFn                    g_OrigPresent = nullptr;
 static ExecuteCommandListsFn        g_OrigExecuteCommandLists = nullptr;
 static bool                         g_PositionMode = false;
+static bool                         g_MenuOpen = false;     // F8 convenience menu
+
+// While dragging (F7) or in the menu (F8) the overlay owns the mouse and keyboard
+static bool InputCaptured() { return g_PositionMode || g_MenuOpen; }
 
 // Cursor hooks for position mode
 using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
@@ -48,7 +55,7 @@ static RECT               g_SavedClipRect = {};
 static bool               g_HadClipRect = false;
 
 static BOOL WINAPI hkClipCursor(const RECT* lpRect) {
-    if (g_PositionMode) {
+    if (InputCaptured()) {
         if (lpRect) { g_SavedClipRect = *lpRect; g_HadClipRect = true; }
         return TRUE;
     }
@@ -56,12 +63,12 @@ static BOOL WINAPI hkClipCursor(const RECT* lpRect) {
 }
 
 static BOOL WINAPI hkSetCursorPos(int X, int Y) {
-    if (g_PositionMode) return TRUE;
+    if (InputCaptured()) return TRUE;
     return g_OrigSetCursorPos(X, Y);
 }
 
 static UINT WINAPI hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader) {
-    if (g_PositionMode && pData != nullptr) {
+    if (InputCaptured() && pData != nullptr) {
         UINT result = g_OrigGetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
         if (result != (UINT)-1 && uiCommand == RID_INPUT) {
             RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(pData);
@@ -84,22 +91,29 @@ static void InitImGui(IDXGISwapChain3* swapChain);
 static void CleanupRenderTargets();
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // F7 toggles position mode
-    if (msg == WM_KEYDOWN && wParam == VK_F7) {
-        g_PositionMode = !g_PositionMode;
-        Log("Position mode: %s", g_PositionMode ? "ON (drag gauge)" : "OFF (locked)");
+    // F7 toggles position mode, F8 the convenience menu (Esc also closes it)
+    bool toggle = msg == WM_KEYDOWN && (wParam == VK_F7 || wParam == VK_F8 || (wParam == VK_ESCAPE && g_MenuOpen));
+    if (toggle) {
+        bool wasCaptured = InputCaptured();
+        if (wParam == VK_F7) {
+            g_PositionMode = !g_PositionMode;
+            Log("Position mode: %s", g_PositionMode ? "ON (drag gauge)" : "OFF (locked)");
+        } else {
+            g_MenuOpen = wParam == VK_F8 ? !g_MenuOpen : false;
+            Log("Convenience menu: %s", g_MenuOpen ? "open" : "closed");
+        }
 
-        if (g_PositionMode) {
+        if (InputCaptured() && !wasCaptured) {
             ImGui::GetIO().MouseDrawCursor = true;
             if (g_OrigClipCursor) g_OrigClipCursor(nullptr);
-        } else {
+        } else if (!InputCaptured() && wasCaptured) {
             ImGui::GetIO().MouseDrawCursor = false;
             if (g_HadClipRect && g_OrigClipCursor) g_OrigClipCursor(&g_SavedClipRect);
         }
         return 0;
     }
 
-    if (g_PositionMode) {
+    if (InputCaptured()) {
         if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
             return 0;
 
@@ -216,7 +230,7 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
 
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.NumDescriptors = 2;
+    srvHeapDesc.NumDescriptors = 1 + kMaxGameTextures;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = g_Device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&g_SrvDescHeap));
     if (FAILED(hr)) { Log("InitImGui: SRV heap failed 0x%08X", hr); CleanupRenderTargets(); return; }
@@ -252,6 +266,21 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
     auto& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
+    // Default font stays first (the gauge uses it); a serif one for the buff timers' numbers.
+    // times/georgia are in both Windows and Proton prefixes.
+    io.Fonts->AddFontDefault();
+    char fontDir[MAX_PATH] = {};
+    GetWindowsDirectoryA(fontDir, MAX_PATH);
+    for (const char* name : { "times.ttf", "georgia.ttf", "arial.ttf" }) {
+        char path[MAX_PATH];
+        snprintf(path, MAX_PATH, "%s\\Fonts\\%s", fontDir, name);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+        if ((g_TimerFont = io.Fonts->AddFontFromFileTTF(path, 18.0f))) {
+            Log("InitImGui: timer font %s", path);
+            break;
+        }
+    }
+
     ImGui_ImplWin32_Init(g_GameWindow);
 
     // Use the new InitInfo API which includes CommandQueue for font upload
@@ -282,7 +311,7 @@ static void InitImGui(IDXGISwapChain3* swapChain) {
 }
 
 uint64_t CreateTextureFromDds(const uint8_t* dds, size_t size) {
-    if (!g_Initialized || g_GameTexture || size < 0x94 ||
+    if (!g_Initialized || g_GameTextureCount >= kMaxGameTextures || size < 0x94 ||
         memcmp(dds, "DDS ", 4) != 0 || memcmp(dds + 0x54, "DX10", 4) != 0) return 0;
 
     UINT height, width, dxgi;
@@ -397,12 +426,16 @@ uint64_t CreateTextureFromDds(const uint8_t* dds, size_t size) {
     UINT inc = g_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_SrvDescHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_SrvDescHeap->GetGPUDescriptorHandleForHeapStart();
-    cpu.ptr += inc;
-    gpu.ptr += inc;
+    cpu.ptr += inc * (1 + g_GameTextureCount);
+    gpu.ptr += inc * (1 + g_GameTextureCount);
     g_Device->CreateShaderResourceView(tex, &srv, cpu);
-    g_GameTexture = tex;
+    g_GameTextures[g_GameTextureCount++] = tex;
     Log("CreateTextureFromDds: %ux%u format %u uploaded", width, height, dxgi);
     return gpu.ptr;
+}
+
+ImFont* TimerFont() {
+    return g_TimerFont;
 }
 
 void SetRenderCallback(RenderCallback cb) {
@@ -536,6 +569,10 @@ bool Init() {
     return true;
 }
 
+bool IsMenuOpen() {
+    return g_MenuOpen;
+}
+
 bool IsPositionMode() {
     return g_PositionMode;
 }
@@ -562,7 +599,8 @@ static void CleanupRenderTargets() {
     for (auto& rt : g_RenderTargets) { if (rt) { rt->Release(); rt = nullptr; } }
     for (auto& alloc : g_CommandAllocators) { if (alloc) { alloc->Release(); alloc = nullptr; } }
     if (g_CommandList) { g_CommandList->Release(); g_CommandList = nullptr; }
-    if (g_GameTexture) { g_GameTexture->Release(); g_GameTexture = nullptr; }
+    for (auto& t : g_GameTextures) if (t) { t->Release(); t = nullptr; }
+    g_GameTextureCount = 0;
     if (g_SrvDescHeap) { g_SrvDescHeap->Release(); g_SrvDescHeap = nullptr; }
     if (g_RtvDescHeap) { g_RtvDescHeap->Release(); g_RtvDescHeap = nullptr; }
     if (g_Device) { g_Device->Release(); g_Device = nullptr; }

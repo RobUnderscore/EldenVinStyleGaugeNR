@@ -40,35 +40,40 @@ static bool ReadWholeFile(const char* path, std::vector<uint8_t>& data) {
 }
 
 bool LoadDds(const char* tpfDcxPath, const wchar_t* name, std::vector<uint8_t>& dds) {
+    return LoadDdsMany(tpfDcxPath, &name, &dds, 1) == 1;
+}
+
+int LoadDdsMany(const char* tpfDcxPath, const wchar_t* const* names, std::vector<uint8_t>* out, int count) {
     std::vector<uint8_t> dcx;
-    if (!ReadWholeFile(tpfDcxPath, dcx)) { Log("GameTextures: can't read %s", tpfDcxPath); return false; }
+    if (!ReadWholeFile(tpfDcxPath, dcx)) { Log("GameTextures: can't read %s", tpfDcxPath); return 0; }
 
     // DCX: "DCX\0" ... "DCS\0" raw/compressed sizes (big endian) at 0x1C/0x20, "KRAK" at 0x28, data at 0x4C
     if (dcx.size() < 0x4C || memcmp(dcx.data(), "DCX\0", 4) != 0 || memcmp(dcx.data() + 0x28, "KRAK", 4) != 0) {
         Log("GameTextures: %s is not a Kraken DCX", tpfDcxPath);
-        return false;
+        return 0;
     }
     uint32_t rawSize = ReadBE32(dcx.data() + 0x1C);
     uint32_t compSize = ReadBE32(dcx.data() + 0x20);
-    if (0x4C + (size_t)compSize > dcx.size()) { Log("GameTextures: truncated DCX"); return false; }
+    if (0x4C + (size_t)compSize > dcx.size()) { Log("GameTextures: truncated DCX"); return 0; }
 
     HMODULE oodle = LoadLibraryA("oo2core_6_win64.dll");
     auto decompress = oodle ? (OodleDecompressFn)GetProcAddress(oodle, "OodleLZ_Decompress") : nullptr;
-    if (!decompress) { Log("GameTextures: oo2core_6_win64.dll not available"); return false; }
+    if (!decompress) { Log("GameTextures: oo2core_6_win64.dll not available"); return 0; }
 
     std::vector<uint8_t> tpf(rawSize);
     int64_t got = decompress(dcx.data() + 0x4C, compSize, tpf.data(), rawSize,
         1, 0, 0, nullptr, 0, nullptr, nullptr, nullptr, 0, 3);
     dcx.clear(); dcx.shrink_to_fit();
-    if (got != rawSize) { Log("GameTextures: decompress returned %lld of %u", (long long)got, rawSize); return false; }
+    if (got != rawSize) { Log("GameTextures: decompress returned %lld of %u", (long long)got, rawSize); return 0; }
 
     // TPF (PC): "TPF\0", data size, file count, platform, flag2, encoding (1 = UTF-16 names), 0;
     // then per texture: data offset, size, format, type, mipmaps, flags1, name offset, hasFloatStruct
-    if (rawSize < 0x10 || memcmp(tpf.data(), "TPF\0", 4) != 0) { Log("GameTextures: not a TPF"); return false; }
-    uint32_t count = ReadLE32(&tpf[8]);
+    if (rawSize < 0x10 || memcmp(tpf.data(), "TPF\0", 4) != 0) { Log("GameTextures: not a TPF"); return 0; }
+    uint32_t fileCount = ReadLE32(&tpf[8]);
     uint8_t encoding = tpf[0xE];
+    int found = 0;
     size_t off = 0x10;
-    for (uint32_t i = 0; i < count && off + 0x14 <= rawSize; i++) {
+    for (uint32_t i = 0; i < fileCount && off + 0x14 <= rawSize && found < count; i++) {
         uint32_t dataOff = ReadLE32(&tpf[off]);
         uint32_t dataSize = ReadLE32(&tpf[off + 4]);
         uint8_t flags1 = tpf[off + 11];
@@ -78,18 +83,23 @@ bool LoadDds(const char* tpfDcxPath, const wchar_t* name, std::vector<uint8_t>& 
         if (hasFloat && off + 8 <= rawSize) off += 8 + ReadLE32(&tpf[off + 4]);
 
         if (encoding != 1 || nameOff >= rawSize) continue;
-        size_t len = wcslen(name);
-        if (nameOff + (len + 1) * 2 > rawSize) continue;
-        if (memcmp(&tpf[nameOff], name, len * 2) != 0 || tpf[nameOff + len * 2] || tpf[nameOff + len * 2 + 1]) continue;
+        for (int n = 0; n < count; n++) {
+            const wchar_t* name = names[n];
+            size_t len = wcslen(name);
+            if (!out[n].empty() || nameOff + (len + 1) * 2 > rawSize) continue;
+            if (memcmp(&tpf[nameOff], name, len * 2) != 0 || tpf[nameOff + len * 2] || tpf[nameOff + len * 2 + 1]) continue;
 
-        if (flags1 == 2 || flags1 == 3) { Log("GameTextures: %ls is compressed inside the TPF", name); return false; }
-        if ((size_t)dataOff + dataSize > rawSize) { Log("GameTextures: bad offset for %ls", name); return false; }
-        dds.assign(tpf.begin() + dataOff, tpf.begin() + dataOff + dataSize);
-        Log("GameTextures: loaded %ls (%u bytes) from %s", name, dataSize, tpfDcxPath);
-        return true;
+            if (flags1 == 2 || flags1 == 3) { Log("GameTextures: %ls is compressed inside the TPF", name); break; }
+            if ((size_t)dataOff + dataSize > rawSize) { Log("GameTextures: bad offset for %ls", name); break; }
+            out[n].assign(tpf.begin() + dataOff, tpf.begin() + dataOff + dataSize);
+            Log("GameTextures: loaded %ls (%u bytes) from %s", name, dataSize, tpfDcxPath);
+            found++;
+            break;
+        }
     }
-    Log("GameTextures: %ls not found in %s", name, tpfDcxPath);
-    return false;
+    for (int n = 0; n < count; n++)
+        if (out[n].empty()) Log("GameTextures: %ls not found in %s", names[n], tpfDcxPath);
+    return found;
 }
 
 } // namespace GameTextures

@@ -8,6 +8,10 @@ namespace GameTextures {
 // using the Oodle DLL that ships with the game. Returns false on any problem.
 bool LoadDds(const char* tpfDcxPath, const wchar_t* name, std::vector<uint8_t>& dds);
 
+// Same for several textures from one file (decompressed once). out[i] gets names[i], or stays
+// empty if it isn't there. Returns how many were found.
+int LoadDdsMany(const char* tpfDcxPath, const wchar_t* const* names, std::vector<uint8_t>* out, int count);
+
 // Path of a file relative to this DLL's folder
 void PathNextToDll(const char* relative, char* out, size_t outSize);
 
