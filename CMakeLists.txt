@@ -44,6 +44,7 @@ add_library(VinStyleRankGauge SHARED
     src/buff_timers.cpp
     src/convenience_menu.cpp
     src/hotkey_sheet.cpp
+    src/coop_resync.cpp
 )
 
 target_link_libraries(VinStyleRankGauge PRIVATE

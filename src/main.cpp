@@ -1,6 +1,8 @@
 #include <Windows.h>
 #include <Psapi.h>
 #include <cstdio>
+#include <cstring>
+#include "coop_resync.h"
 #include "d3dhook.h"
 #include "memory.h"
 #include "overlay.h"
@@ -70,6 +72,10 @@ static DWORD WINAPI InitThread(LPVOID hModule) {
         Log("ERROR: D3D12 hook failed!");
     }
 
+    // Elden Ring co-op resync (F8 menu): its member-left guard hook goes in with ours
+    bool eldenRing = strcmp(game->moduleName, "eldenring.exe") == 0;
+    if (eldenRing) CoopResync::Init();
+
     // Signal that our MinHook detours are in place. Two MinHook instances patching
     // the same Present concurrently can clobber each other, so another overlay in
     // this process can wait on this event before installing its own hooks.
@@ -79,6 +85,9 @@ static DWORD WINAPI InitThread(LPVOID hModule) {
         SetEvent(ready);
         Log("Signalled VinStyleRankGauge_HooksInstalled");
     }
+
+    // waits for the game's task system, so after the event
+    if (eldenRing) CoopResync::StartTask();
 
     Log("Initialization complete");
     return 0;

@@ -1,4 +1,5 @@
 #include "convenience_menu.h"
+#include "coop_resync.h"
 #include "memory.h"
 #include "game_textures.h"
 #include <Windows.h>
@@ -196,6 +197,8 @@ void Draw(ImFont* font, bool open) {
 
     ImGui::Begin("Convenience  (F8 to close)", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+
+    CoopResync::DrawMenuSection(scale);
 
     if (!s_FileError.empty()) {
         ImGui::TextUnformatted(s_FileError.c_str());
