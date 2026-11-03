@@ -1,8 +1,12 @@
 #include "convenience_menu.h"
 #include "coop_resync.h"
+#include "drop_finder.h"
+#include "flying_mount.h"
+#include "native_menu.h"
 #include "memory.h"
 #include "game_textures.h"
 #include <Windows.h>
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -25,12 +29,7 @@ static const char* MAP_ITEM_MAN_AOB = "48 8B 0D ?? ?? ?? ?? C7 44 24 50 FF FF FF
 
 using ItemGibFn = void(*)(void* mapItemMan, void* itemList, void* header, uint64_t zero);
 
-struct Entry {
-    std::string section;
-    std::string label;
-    uint32_t id = 0;        // with the category bits
-    int quantity = 1;
-};
+using Entry = Gift;
 
 static std::vector<Entry> s_Entries;
 static std::string s_FileError;
@@ -70,13 +69,13 @@ static uint32_t CategoryBits(const char* cat, bool& ok) {
 }
 
 // ConvenienceMenu.txt:  [Section]  /  <category> <id> [xQuantity] <label...>  /  # comment
-static void LoadFile() {
-    s_Entries.clear();
-    s_FileError.clear();
+bool ReadGifts(std::vector<Gift>& out, std::string& error) {
+    out.clear();
+    error.clear();
     char path[MAX_PATH];
     GameTextures::PathNextToDll("ConvenienceMenu.txt", path, sizeof(path));
     FILE* f = fopen(path, "r");
-    if (!f) { s_FileError = "ConvenienceMenu.txt not found next to the DLL"; return; }
+    if (!f) { error = "ConvenienceMenu.txt not found next to the DLL"; return false; }
 
     std::string section;
     char line[512];
@@ -113,11 +112,14 @@ static void LoadFile() {
         }
         if (e.quantity < 1) e.quantity = 1;
         e.label = *rest ? rest : std::to_string(id);
-        s_Entries.push_back(e);
+        out.push_back(e);
     }
     fclose(f);
-    Log("ConvenienceMenu: %zu entries from %s", s_Entries.size(), path);
+    Log("ConvenienceMenu: %zu entries from %s", out.size(), path);
+    return true;
 }
+
+static void LoadFile() { ReadGifts(s_Entries, s_FileError); }
 
 struct GiveRequest { uint32_t id; int quantity; };
 
@@ -161,7 +163,7 @@ bool GiveItem(uint32_t id, int quantity) {
     return true;
 }
 
-static void Give(const Entry& e) {
+std::string Receive(const Gift& e) {
     char msg[256];
     if (!Memory::GetChrIns()) {
         snprintf(msg, sizeof(msg), "Load into the game first");
@@ -179,12 +181,17 @@ static void Give(const Entry& e) {
             snprintf(msg, sizeof(msg), "Couldn't start the give thread");
         }
     }
-    s_Status = msg;
+    return msg;
+}
+
+static void Give(const Entry& e) {
+    s_Status = Receive(e);
     s_StatusUntil = ImGui::GetTime() + 4.0;
 }
 
 void Draw(ImFont* font, bool open) {
-    if (open && !s_WasOpen) LoadFile();
+    bool appearing = open && !s_WasOpen;
+    if (appearing) LoadFile();
     s_WasOpen = open;
     if (!open) return;
 
@@ -192,8 +199,17 @@ void Draw(ImFont* font, bool open) {
     float scale = io.DisplaySize.y / 1080.0f;
     if (font) ImGui::PushFont(font, floorf(22.0f * scale));
 
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.45f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(560.0f * scale, 0.0f), ImGuiCond_Always);
+    // centred, or side by side with the item finder (both centred) while that's open
+    static bool s_FinderShown = false;
+    bool finder = DropFinder::WindowOpen();
+    float menuW = 560.0f * scale;
+    if (appearing || finder != s_FinderShown) {
+        s_FinderShown = finder;
+        float total = menuW + (finder ? 12.0f * scale + DropFinder::WindowWidth(scale) : 0.0f);
+        float left = (std::max)(16.0f * scale, (io.DisplaySize.x - total) * 0.5f);
+        ImGui::SetNextWindowPos(ImVec2(left + menuW * 0.5f, io.DisplaySize.y * 0.45f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    }
+    ImGui::SetNextWindowSize(ImVec2(menuW, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, io.DisplaySize.y * 0.8f));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(16, 14, 11, 235));
     ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(146, 139, 108, 255));
@@ -211,15 +227,21 @@ void Draw(ImFont* font, bool open) {
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
 
     CoopResync::DrawMenuSection(scale);
+    DropFinder::DrawMenuSection(scale);
+    FlyingMount::DrawMenuSection(scale);
 
-    if (!s_FileError.empty()) {
+    bool native = NativeMenu::Active();
+    if (native) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.62f, 0.58f, 0.48f, 1.0f), "Co-op buttons, switches and items: Esc > System > Game Options > Vin-Swag");
+    } else if (!s_FileError.empty()) {
         ImGui::TextUnformatted(s_FileError.c_str());
     } else if (s_Entries.empty()) {
         ImGui::TextUnformatted("ConvenienceMenu.txt has no entries");
     }
 
     std::string section = "\x01";
-    for (size_t i = 0; i < s_Entries.size(); i++) {
+    for (size_t i = 0; i < (native ? 0 : s_Entries.size()); i++) {
         const Entry& e = s_Entries[i];
         if (e.section != section) {
             section = e.section;
@@ -243,7 +265,9 @@ void Draw(ImFont* font, bool open) {
         ImGui::TextUnformatted(s_Status.c_str());
     }
 
+    ImVec2 menuPos = ImGui::GetWindowPos(), menuSize = ImGui::GetWindowSize();
     ImGui::End();
+    DropFinder::DrawWindow(scale, ImVec2(menuPos.x + menuSize.x + 12.0f * scale, menuPos.y));
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(9);
     if (font) ImGui::PopFont();

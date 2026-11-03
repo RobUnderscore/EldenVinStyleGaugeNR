@@ -28,20 +28,34 @@ static const char* GetDllConfigPath() {
     return g_DllConfigPath;
 }
 
-static const char* GetUserConfigPath() {
-    if (g_UserConfigPath[0] == 0) {
+// %APPDATA%\VinStyleRankGauge (created), or empty if there's no APPDATA
+static const char* GetUserDir() {
+    static char dir[MAX_PATH] = {};
+    if (dir[0] == 0) {
         char appdata[MAX_PATH] = {};
         if (FAILED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
             const char* env = getenv("APPDATA");
             if (env) strncpy(appdata, env, MAX_PATH - 1);
-            else return GetDllConfigPath(); // fallback
+            else return dir;
         }
-        char dir[MAX_PATH];
         snprintf(dir, MAX_PATH, "%s\\VinStyleRankGauge", appdata);
         CreateDirectoryA(dir, nullptr);
-        snprintf(g_UserConfigPath, MAX_PATH, "%s\\VinStyleRankGauge.ini", dir);
+    }
+    return dir;
+}
+
+static const char* GetUserConfigPath() {
+    if (g_UserConfigPath[0] == 0) {
+        if (!GetUserDir()[0]) return GetDllConfigPath(); // fallback
+        snprintf(g_UserConfigPath, MAX_PATH, "%s\\VinStyleRankGauge.ini", GetUserDir());
     }
     return g_UserConfigPath;
+}
+
+bool UserFile(const char* name, char* out, size_t size) {
+    if (!GetUserDir()[0]) return false;
+    snprintf(out, size, "%s\\%s", GetUserDir(), name);
+    return true;
 }
 
 static float ReadFloat(FILE* f, const char* key, float defaultVal) {
@@ -114,6 +128,8 @@ static void WriteDefaultConfig(const char* path) {
     fprintf(f, "buffPerRow = 10\n");
     fprintf(f, "buffMinDuration = 3\n");
     fprintf(f, "buffOpacity = 0.95\n");
+    fprintf(f, "# buffOnHud = 1 puts the times under the game's own status icons; the row keeps the rest.\n");
+    fprintf(f, "buffOnHud = 1\n");
     fclose(f);
 }
 
@@ -139,6 +155,7 @@ static GaugeConfig LoadFrom(const char* path) {
     cfg.buffPerRow = ReadFloat(f, "buffPerRow", cfg.buffPerRow);
     cfg.buffMinDuration = ReadFloat(f, "buffMinDuration", cfg.buffMinDuration);
     cfg.buffOpacity = ReadFloat(f, "buffOpacity", cfg.buffOpacity);
+    cfg.buffOnHud = ReadBool(f, "buffOnHud", cfg.buffOnHud);
     fclose(f);
     return cfg;
 }
@@ -197,6 +214,7 @@ void Save(const GaugeConfig& cfg) {
     fprintf(f, "buffPerRow = %.0f\n", cfg.buffPerRow);
     fprintf(f, "buffMinDuration = %.1f\n", cfg.buffMinDuration);
     fprintf(f, "buffOpacity = %.2f\n", cfg.buffOpacity);
+    fprintf(f, "buffOnHud = %d\n", cfg.buffOnHud ? 1 : 0);
     fclose(f);
 
     Log("Config: saved position (%.4f, %.4f) to %s", cfg.posX, cfg.posY, path);

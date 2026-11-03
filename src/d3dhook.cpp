@@ -4,12 +4,19 @@
 #include <imgui_impl_dx12.h>
 #include <imgui_impl_win32.h>
 #include <Psapi.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#include <intrin.h>
+#include <algorithm>
+#include <utility>
 #include <vector>
 #include <cstdio>
 #include <cstring>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dinput8.lib")
+#pragma comment(lib, "dxguid.lib")
 
 extern void Log(const char* fmt, ...);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -22,9 +29,10 @@ using ExecuteCommandListsFn = void(WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12Com
 static ID3D12Device*                g_Device = nullptr;
 static ID3D12DescriptorHeap*        g_SrvDescHeap = nullptr;
 static ID3D12DescriptorHeap*        g_RtvDescHeap = nullptr;
-static constexpr int                kMaxGameTextures = 7;
+static constexpr int                kMaxGameTextures = 10;  // status sheets, item icons, the minimap atlas
 static ID3D12Resource*              g_GameTextures[kMaxGameTextures] = {}; // SRV slots 1.. (slot 0 is ImGui's font)
 static int                          g_GameTextureCount = 0;
+static int                          g_AtlasCount = 0;     // CreateAtlas (below)
 static ImFont*                      g_TimerFont = nullptr;
 static ID3D12CommandQueue*          g_CommandQueue = nullptr;
 static ID3D12GraphicsCommandList*   g_CommandList = nullptr;
@@ -86,6 +94,115 @@ static UINT WINAPI hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID
         return result;
     }
     return g_OrigGetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+}
+
+// The games read the keyboard and mouse through DirectInput (Elden Ring also asks GetKeyboardState /
+// GetKeyState), not the window messages HandleInput swallows: typing in the F8 menu walked and used items. While
+// F7/F8 own the input those reads see nothing pressed; releases still go through, so a key held when the menu
+// opened isn't stuck down after it closes.
+using DIGetStateFn = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
+using DIGetDataFn = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+using GetKeyboardStateFn = BOOL(WINAPI*)(PBYTE);
+using GetKeyStateFn = SHORT(WINAPI*)(int);
+static DIGetStateFn g_OrigDIGetState[4] = {};
+static DIGetDataFn g_OrigDIGetData[4] = {};
+static GetKeyboardStateFn g_OrigGetKeyboardState = nullptr;
+static GetKeyStateFn g_OrigGetKeyState = nullptr;
+static uintptr_t g_GameLo = 0, g_GameHi = 0;
+
+template <int N> static HRESULT STDMETHODCALLTYPE hkDIGetState(void* dev, DWORD size, LPVOID data) {
+    HRESULT hr = g_OrigDIGetState[N](dev, size, data);
+    if (SUCCEEDED(hr) && data && InputCaptured()) memset(data, 0, size);
+    return hr;
+}
+
+template <int N> static HRESULT STDMETHODCALLTYPE hkDIGetData(void* dev, DWORD objSize, LPDIDEVICEOBJECTDATA data, LPDWORD count, DWORD flags) {
+    HRESULT hr = g_OrigDIGetData[N](dev, objSize, data, count, flags);
+    if (SUCCEEDED(hr) && data && count && objSize >= sizeof(DWORD) * 2 && InputCaptured()) {
+        // keep releases only (dwData 0: a key or button up)
+        uint8_t* bytes = reinterpret_cast<uint8_t*>(data);
+        DWORD kept = 0;
+        for (DWORD i = 0; i < *count; i++) {
+            const DIDEVICEOBJECTDATA* e = reinterpret_cast<const DIDEVICEOBJECTDATA*>(bytes + i * objSize);
+            if (e->dwData != 0) continue;
+            if (kept != i) memmove(bytes + kept * objSize, e, objSize);
+            kept++;
+        }
+        *count = kept;
+    }
+    return hr;
+}
+
+static bool FromGame(void* ret) {
+    uintptr_t r = reinterpret_cast<uintptr_t>(ret);
+    return r >= g_GameLo && r < g_GameHi;
+}
+
+static BOOL WINAPI hkGetKeyboardState(PBYTE keys) {
+    BOOL ok = g_OrigGetKeyboardState(keys);
+    if (ok && keys && InputCaptured() && FromGame(_ReturnAddress())) memset(keys, 0, 256);
+    return ok;
+}
+
+// only the game's own calls: ImGui's Win32 backend asks GetKeyState for Shift/Ctrl
+static SHORT WINAPI hkGetKeyState(int vk) {
+    if (InputCaptured() && FromGame(_ReturnAddress())) return 0;
+    return g_OrigGetKeyState(vk);
+}
+
+// DirectInput's GetDeviceState / GetDeviceData (device vtable slots 9 and 10), from throwaway keyboard and mouse
+// devices of both the ANSI and wide interfaces (each distinct function once)
+static void HookGameInput() {
+    MODULEINFO mi{};
+    if (GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(nullptr), &mi, sizeof(mi))) {
+        g_GameLo = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+        g_GameHi = g_GameLo + mi.SizeOfImage;
+    }
+    std::vector<void*> states, datas;
+    auto collect = [&](void** vt) {
+        if (std::find(states.begin(), states.end(), vt[9]) == states.end()) states.push_back(vt[9]);
+        if (std::find(datas.begin(), datas.end(), vt[10]) == datas.end()) datas.push_back(vt[10]);
+    };
+    HINSTANCE inst = GetModuleHandleA(nullptr);
+    IDirectInput8A* diA = nullptr;
+    if (SUCCEEDED(DirectInput8Create(inst, DIRECTINPUT_VERSION, IID_IDirectInput8A, reinterpret_cast<void**>(&diA), nullptr)) && diA) {
+        for (const GUID* g : { &GUID_SysKeyboard, &GUID_SysMouse }) {
+            IDirectInputDevice8A* dev = nullptr;
+            if (SUCCEEDED(diA->CreateDevice(*g, &dev, nullptr)) && dev) {
+                collect(*reinterpret_cast<void***>(dev));
+                dev->Release();
+            }
+        }
+        diA->Release();
+    }
+    IDirectInput8W* diW = nullptr;
+    if (SUCCEEDED(DirectInput8Create(inst, DIRECTINPUT_VERSION, IID_IDirectInput8W, reinterpret_cast<void**>(&diW), nullptr)) && diW) {
+        for (const GUID* g : { &GUID_SysKeyboard, &GUID_SysMouse }) {
+            IDirectInputDevice8W* dev = nullptr;
+            if (SUCCEEDED(diW->CreateDevice(*g, &dev, nullptr)) && dev) {
+                collect(*reinterpret_cast<void***>(dev));
+                dev->Release();
+            }
+        }
+        diW->Release();
+    }
+    static void* const kStateHooks[4] = { reinterpret_cast<void*>(&hkDIGetState<0>), reinterpret_cast<void*>(&hkDIGetState<1>),
+                                          reinterpret_cast<void*>(&hkDIGetState<2>), reinterpret_cast<void*>(&hkDIGetState<3>) };
+    static void* const kDataHooks[4] = { reinterpret_cast<void*>(&hkDIGetData<0>), reinterpret_cast<void*>(&hkDIGetData<1>),
+                                         reinterpret_cast<void*>(&hkDIGetData<2>), reinterpret_cast<void*>(&hkDIGetData<3>) };
+    for (size_t i = 0; i < states.size() && i < 4; i++) {
+        MH_STATUS st = MH_CreateHook(states[i], kStateHooks[i], reinterpret_cast<void**>(&g_OrigDIGetState[i]));
+        Log("MH_CreateHook(DirectInput GetDeviceState #%d): %d", (int)i, st);
+    }
+    for (size_t i = 0; i < datas.size() && i < 4; i++) {
+        MH_STATUS st = MH_CreateHook(datas[i], kDataHooks[i], reinterpret_cast<void**>(&g_OrigDIGetData[i]));
+        Log("MH_CreateHook(DirectInput GetDeviceData #%d): %d", (int)i, st);
+    }
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (void* f = reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyboardState")))
+        Log("MH_CreateHook(GetKeyboardState): %d", MH_CreateHook(f, reinterpret_cast<void*>(&hkGetKeyboardState), reinterpret_cast<void**>(&g_OrigGetKeyboardState)));
+    if (void* f = reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyState")))
+        Log("MH_CreateHook(GetKeyState): %d", MH_CreateHook(f, reinterpret_cast<void*>(&hkGetKeyState), reinterpret_cast<void**>(&g_OrigGetKeyState)));
 }
 
 static void InitImGui(IDXGISwapChain3* swapChain);
@@ -152,6 +269,11 @@ static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
     // PM_NOREMOVE peeks see the same message again later: only act once, when it's taken
     if (code == HC_ACTION && wParam == PM_REMOVE && g_Initialized) {
         MSG* m = reinterpret_cast<MSG*>(lParam);
+        // a key we swallow never reaches the game's TranslateMessage, so make its WM_CHAR here (typing in the menu)
+        if ((m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN) && InputCaptured()) {
+            MSG copy = *m;
+            TranslateMessage(&copy);
+        }
         if (HandleInput(m->hwnd, m->message, m->wParam, m->lParam)) m->message = WM_NULL;
     }
     return CallNextHookEx(g_MsgHook, code, wParam, lParam);
@@ -476,6 +598,184 @@ uint64_t CreateTextureFromDds(const uint8_t* dds, size_t size) {
     return gpu.ptr;
 }
 
+// ---- atlases: textures filled region by region (the minimap's world-map tiles) ----
+
+struct Atlas {
+    uint64_t id;
+    ID3D12Resource* tex;
+    DXGI_FORMAT format;
+    UINT width, height, blockBytes;
+};
+static Atlas g_Atlases[4] = {};
+
+// Bytes per 4x4 block, or per pixel for the uncompressed format (BlockSide 1)
+static UINT BlockBytes(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+        return 8;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return 16;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return 4;
+    default:
+        return 0;
+    }
+}
+static UINT BlockSide(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_UNORM ? 1 : 4; }
+
+uint64_t CreateAtlas(UINT width, UINT height, UINT dxgi) {
+    DXGI_FORMAT format = (DXGI_FORMAT)dxgi;
+    UINT blockBytes = BlockBytes(format);
+    if (!g_Initialized || !blockBytes || g_GameTextureCount >= kMaxGameTextures || g_AtlasCount >= 4) return 0;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+    ID3D12Resource* tex = nullptr;
+    // zeroed blocks (and zeroed pixels) read as transparent until a region is filled
+    if (FAILED(g_Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)))) {
+        Log("CreateAtlas: texture creation failed");
+        return 0;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    UINT inc = g_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_SrvDescHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_SrvDescHeap->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += inc * (1 + g_GameTextureCount);
+    gpu.ptr += inc * (1 + g_GameTextureCount);
+    g_Device->CreateShaderResourceView(tex, &srv, cpu);
+    g_GameTextures[g_GameTextureCount++] = tex;
+    g_Atlases[g_AtlasCount++] = { gpu.ptr, tex, format, width, height, blockBytes };
+    Log("CreateAtlas: %ux%u format %u", width, height, dxgi);
+    return gpu.ptr;
+}
+
+bool UpdateAtlas(uint64_t id, UINT x, UINT y, const uint8_t* dds, size_t size) {
+    AtlasRegion r{ x, y, dds, size };
+    return UpdateAtlasMany(id, &r, 1) == 1;
+}
+
+int UpdateAtlasMany(uint64_t id, const AtlasRegion* regions, int count) {
+    Atlas* a = nullptr;
+    for (int i = 0; i < g_AtlasCount; i++)
+        if (g_Atlases[i].id == id) a = &g_Atlases[i];
+    if (!a || !g_Initialized || count <= 0) return 0;
+    UINT side = BlockSide(a->format);
+
+    // check each region and lay out its copy in one upload buffer
+    struct Copy {
+        const AtlasRegion* r;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+        UINT numRows;
+        size_t rowBytes;
+    };
+    std::vector<Copy> copies;
+    UINT64 total = 0;
+    for (int i = 0; i < count; i++) {
+        const AtlasRegion& r = regions[i];
+        if (r.size < 0x94 || memcmp(r.dds, "DDS ", 4) != 0 || memcmp(r.dds + 0x54, "DX10", 4) != 0) continue;
+        UINT height, width, dxgi;
+        memcpy(&height, r.dds + 0x0C, 4);
+        memcpy(&width, r.dds + 0x10, 4);
+        memcpy(&dxgi, r.dds + 0x80, 4);
+        if ((DXGI_FORMAT)dxgi != a->format || r.x + width > a->width || r.y + height > a->height ||
+            (r.x | r.y | width | height) % side) continue;
+        size_t rowBytes = (size_t)(width / side) * a->blockBytes;
+        if (0x94 + rowBytes * (height / side) > r.size) continue;
+        D3D12_RESOURCE_DESC region{};
+        region.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        region.Width = width;
+        region.Height = height;
+        region.DepthOrArraySize = 1;
+        region.MipLevels = 1;
+        region.Format = a->format;
+        region.SampleDesc.Count = 1;
+        Copy c{ &r, {}, 0, rowBytes };
+        UINT64 rowSize, size;
+        total = (total + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+        g_Device->GetCopyableFootprints(&region, 0, 1, total, &c.footprint, &c.numRows, &rowSize, &size);
+        total += size;
+        copies.push_back(c);
+    }
+    if (copies.empty()) return 0;
+
+    D3D12_RESOURCE_DESC bufDesc{};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = total;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap{ D3D12_HEAP_TYPE_UPLOAD };
+    ID3D12Resource* upload = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = false;
+    if (SUCCEEDED(g_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))) &&
+        SUCCEEDED(g_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+        SUCCEEDED(g_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list))) &&
+        SUCCEEDED(g_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && done) {
+        uint8_t* mapped = nullptr;
+        if (SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+            for (const Copy& c : copies)
+                for (UINT r = 0; r < c.numRows; r++)
+                    memcpy(mapped + c.footprint.Offset + (size_t)r * c.footprint.Footprint.RowPitch, c.r->dds + 0x94 + r * c.rowBytes, c.rowBytes);
+            upload->Unmap(0, nullptr);
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = a->tex;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            list->ResourceBarrier(1, &barrier);
+            for (const Copy& c : copies) {
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = a->tex;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = upload;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint = c.footprint;
+                list->CopyTextureRegion(&dst, c.r->x, c.r->y, 0, &src, nullptr);
+            }
+            std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            list->ResourceBarrier(1, &barrier);
+            list->Close();
+            // the game's queue runs our copy after the frames already queued, which may still read the old tile
+            ID3D12CommandList* lists[] = { list };
+            g_CommandQueue->ExecuteCommandLists(1, lists);
+            g_CommandQueue->Signal(fence, 1);
+            fence->SetEventOnCompletion(1, done);
+            ok = WaitForSingleObject(done, 5000) == WAIT_OBJECT_0;
+        }
+    }
+    if (done) CloseHandle(done);
+    if (fence) fence->Release();
+    if (list) list->Release();
+    if (alloc) alloc->Release();
+    if (upload) upload->Release();
+    if (!ok) Log("UpdateAtlas: upload failed");
+    return ok ? (int)copies.size() : 0;
+}
+
 ImFont* TimerFont() {
     return g_TimerFont;
 }
@@ -604,6 +904,7 @@ bool Init() {
         mhStatus = MH_CreateHook(getRawInputDataAddr, reinterpret_cast<void*>(&hkGetRawInputData), reinterpret_cast<void**>(&g_OrigGetRawInputData));
         Log("MH_CreateHook(GetRawInputData): %d", mhStatus);
     }
+    HookGameInput();
 
     mhStatus = MH_EnableHook(MH_ALL_HOOKS);
     Log("MH_EnableHook: %d", mhStatus);
@@ -648,6 +949,7 @@ static void CleanupRenderTargets() {
     if (g_CommandList) { g_CommandList->Release(); g_CommandList = nullptr; }
     for (auto& t : g_GameTextures) if (t) { t->Release(); t = nullptr; }
     g_GameTextureCount = 0;
+    g_AtlasCount = 0;  // released with the textures above
     if (g_SrvDescHeap) { g_SrvDescHeap->Release(); g_SrvDescHeap = nullptr; }
     if (g_RtvDescHeap) { g_RtvDescHeap->Release(); g_RtvDescHeap = nullptr; }
     if (g_Device) { g_Device->Release(); g_Device = nullptr; }

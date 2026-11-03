@@ -8,6 +8,10 @@
 #include "convenience_menu.h"
 #include "hotkey_sheet.h"
 #include "coop_resync.h"
+#include "drop_finder.h"
+#include "minimap.h"
+#include "target.h"
+#include "hud_icons.h"
 #include <Windows.h>
 #include <imgui.h>
 #include <atomic>
@@ -429,6 +433,18 @@ static void DrawBuffTimers(bool posMode) {
     UpdateAtlas();
 
     std::vector<BuffTimers::Buff> buffs = BuffTimers::Update(g_Config.buffMinDuration);
+    // times under the game's own icons; the row keeps what the HUD has no icon for (weapon buffs)
+    int32_t hudIcons[HudIcons::kSlots];
+    int hudCount = g_Config.buffOnHud && !posMode ? HudIcons::Icons(hudIcons) : 0;
+    if (hudCount > 0 && !buffs.empty()) {
+        std::vector<bool> placed;
+        BuffTimers::DrawOnHud(ImGui::GetForegroundDrawList(), D3DHook::TimerFont(), buffs, hudIcons, hudCount,
+            ImGui::GetIO().DisplaySize.y / 1080.0f, g_Config.buffOpacity, placed);
+        size_t kept = 0;
+        for (size_t i = 0; i < buffs.size(); i++)
+            if (!placed[i]) buffs[kept++] = buffs[i];
+        buffs.resize(kept);
+    }
     if (posMode && buffs.empty()) buffs = BuffTimers::Preview();
     if (buffs.empty()) return;
 
@@ -505,6 +521,10 @@ void Render(IDXGISwapChain3* swapChain, ID3D12CommandQueue* cmdQueue) {
     if (Memory::Game() && strcmp(Memory::Game()->moduleName, "eldenring.exe") == 0) {
         HotkeySheet::Draw(D3DHook::TimerFont(), D3DHook::IsHotkeySheetOpen());
         CoopResync::DrawBanner(D3DHook::TimerFont());
+        Minimap::Draw(D3DHook::TimerFont());
+        UpdateAtlas();
+        Target::Draw(D3DHook::TimerFont(), s_StatusSheets);
+        DropFinder::DrawTracker(D3DHook::TimerFont());
         ConvenienceMenu::Draw(D3DHook::TimerFont(), D3DHook::IsMenuOpen());
     }
 

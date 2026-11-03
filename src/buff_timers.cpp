@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -18,10 +19,13 @@ static constexpr ptrdiff_t NODE_PARAM = 0x00;
 static constexpr ptrdiff_t NODE_ID = 0x08;
 static constexpr ptrdiff_t PARAM_ICON = 0x00;
 static constexpr ptrdiff_t PARAM_ENDURANCE = 0x08;
+// Elden Ring's spCategory (u16): effects in one category replace each other, so two in different ones are separate
+// buffs even with the same icon (Vins gives Golden Vow and Flame, Grant Me Strength both icon 20406)
+static constexpr ptrdiff_t PARAM_CATEGORY_ER = 0x13e;
 
 static std::vector<Buff> s_Buffs;
-static std::vector<int32_t> s_Order;                   // icon keys (see Key), first seen first
-static std::unordered_map<int32_t, float> s_Peak;      // highest remaining seen per icon
+static std::vector<int64_t> s_Order;                   // icon keys (see Key), first seen first
+static std::unordered_map<int64_t, float> s_Peak;      // highest remaining seen per icon
 static std::unordered_set<int32_t> s_Logged;           // effect ids already written to the log
 
 bool IconRect(int32_t iconId, int& sheet, float& x, float& y, float& w, float& h) {
@@ -43,8 +47,8 @@ static bool WeaponBuffCell(int32_t effectId, int16_t& cell) {
     return true;
 }
 
-// Buffs are merged per icon: status icons by id, item icons by cell
-static int32_t Key(const Buff& b) { return b.cell >= 0 ? -1 - b.cell : b.iconId; }
+// Buffs are merged per icon (status icons by id, item icons by cell) and category
+static int64_t Key(const Buff& b) { return (int64_t)(b.cell >= 0 ? -1 - b.cell : b.iconId) << 16 | b.category; }
 
 const char* ItemIconsFile() { return "BuffIcons.dds"; }
 
@@ -61,7 +65,8 @@ const std::vector<Buff>& Update(float minDuration) {
         return s_Buffs;
     }
 
-    std::unordered_map<int32_t, Buff> byIcon;  // by Key()
+    std::unordered_map<int64_t, Buff> byIcon;  // by Key()
+    bool eldenRing = !strcmp(game->moduleName, "eldenring.exe");
     uintptr_t node = head;
     int count = 0;
     do {
@@ -89,6 +94,7 @@ const std::vector<Buff>& Update(float minDuration) {
             if (endurance > total) total = endurance;
             if (nodeTotal > total && nodeTotal < 100000.0f) total = nodeTotal;
             Buff b{ icon, remaining, total, cell };
+            if (eldenRing && row) b.category = Memory::Read<uint16_t>(row + PARAM_CATEGORY_ER);
             auto it = byIcon.find(Key(b));
             if (it == byIcon.end() || remaining > it->second.remaining)
                 byIcon[Key(b)] = b;
@@ -109,11 +115,11 @@ const std::vector<Buff>& Update(float minDuration) {
         it = byIcon.count(it->first) ? std::next(it) : s_Peak.erase(it);
 
     s_Order.erase(std::remove_if(s_Order.begin(), s_Order.end(),
-        [&](int32_t key) { return !byIcon.count(key); }), s_Order.end());
+        [&](int64_t key) { return !byIcon.count(key); }), s_Order.end());
     for (auto& [key, b] : byIcon)
         if (std::find(s_Order.begin(), s_Order.end(), key) == s_Order.end()) s_Order.push_back(key);
 
-    for (int32_t key : s_Order) {
+    for (int64_t key : s_Order) {
         const Buff& b = byIcon[key];
         if (b.total >= minDuration) s_Buffs.push_back(b);
     }
@@ -218,6 +224,38 @@ void Draw(ImDrawList* draw, ImFont* font, const Sheets& sheets, const std::vecto
         ImVec2 ts = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, text);
         float tx = floorf(cx + (iconSize - ts.x) * 0.5f);
         float ty = by + barH + floorf(2.0f * scale);
+        ImU32 shadow = WithAlpha(0, 0, 0, opacity * 0.9f);
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dy = -1; dy <= 1; dy++)
+                if (dx || dy) draw->AddText(font, textSize, ImVec2(tx + dx, ty + dy), shadow, text);
+        draw->AddText(font, textSize, ImVec2(tx, ty), WithAlpha(r, g, bl, opacity * pulse), text);
+    }
+}
+
+void DrawOnHud(ImDrawList* draw, ImFont* font, const std::vector<Buff>& buffs, const int32_t* icons, int count,
+               float scale, float opacity, std::vector<bool>& placed) {
+    if (!font) font = ImGui::GetFont();
+    placed.assign(buffs.size(), false);
+    const float textSize = floorf(16.0f * scale), t = (float)ImGui::GetTime();
+    for (int slot = 0; slot < count; slot++) {
+        float remaining = -1.0f;
+        for (size_t i = 0; i < buffs.size(); i++) {
+            const Buff& b = buffs[i];
+            // weapon buffs have no icon of their own on the HUD
+            if (b.cell >= 0 || b.iconId != icons[slot] || b.iconId == kWeaponBuffFallbackIcon) continue;
+            placed[i] = true;
+            remaining = std::max(remaining, b.remaining);
+        }
+        if (remaining <= 0.0f) continue;
+        // the grid JourneyHUD found: rows of 14, 42 px apart, 41 px between rows; x is the icon's centre
+        float cx = (155.5f + 42.0f * (slot % 14)) * scale, ty = floorf((146.0f + 41.0f * (slot / 14)) * scale);
+        int r, g, bl;
+        TimeColor(remaining, r, g, bl);
+        float pulse = remaining < 5.0f ? 0.55f + 0.45f * fabsf(sinf(t * 5.0f)) : 1.0f;
+        char text[16];
+        FormatTime(remaining, text, sizeof(text));
+        ImVec2 ts = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, text);
+        float tx = floorf(cx - ts.x * 0.5f);
         ImU32 shadow = WithAlpha(0, 0, 0, opacity * 0.9f);
         for (int dx = -1; dx <= 1; dx++)
             for (int dy = -1; dy <= 1; dy++)

@@ -5,6 +5,7 @@
 #include "coop_resync.h"
 #include "d3dhook.h"
 #include "memory.h"
+#include "native_menu.h"
 #include "overlay.h"
 
 #pragma comment(lib, "psapi.lib")
@@ -98,6 +99,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         g_InitThread = CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
+        // ERNativeUI takes menus only in the first seconds of startup: connect now, not after the init above
+        if (GetModuleHandleA("eldenring.exe")) NativeMenu::Start();
         break;
 
     case DLL_PROCESS_DETACH:

@@ -45,6 +45,15 @@ add_library(VinStyleRankGauge SHARED
     src/convenience_menu.cpp
     src/hotkey_sheet.cpp
     src/coop_resync.cpp
+    src/drop_finder.cpp
+    src/item_icons.cpp
+    src/world.cpp
+    src/minimap.cpp
+    src/target.cpp
+    src/hud_icons.cpp
+    src/native_menu.cpp
+    src/horse_up.cpp
+    src/flying_mount.cpp
 )
 
 target_link_libraries(VinStyleRankGauge PRIVATE
@@ -55,9 +64,10 @@ target_link_libraries(VinStyleRankGauge PRIVATE
     dxgi
     dwmapi
     shell32
+    winmm
 )
 
-target_include_directories(VinStyleRankGauge PRIVATE src)
+target_include_directories(VinStyleRankGauge PRIVATE src deps/ernativeui/include deps/bcdec)
 
 set_target_properties(VinStyleRankGauge PROPERTIES
     OUTPUT_NAME "VinStyleRankGauge"
