@@ -5,6 +5,7 @@
 // action/script/modules/FlyingMount.lua) and the event script (common.emevd 12110268-9) go by: it lasts 2 s and is
 // put back twice a second through the game's own apply-SpEffect routine (0x3e8dc0(chr, id, dont_sync = 1),
 // er-coop/docs/spec/party.md), so only this machine has it. Off, it runs out. The game files: er-flying-mount/.
+// The window's other checkbox, infinite Torrent jumps, does the same with its own marker, 100912.
 namespace FlyingMount {
 
 // From CoopResync's per-frame game task

@@ -14,12 +14,14 @@ using namespace World;
 static constexpr uintptr_t WORLD_CHR_MAN = 0x3d6d018;  // +0x1e508 the main player
 static constexpr uintptr_t MAIN_PLAYER = 0x1e508;
 static constexpr int32_t kOnEffect = 100910;
+static constexpr int32_t kJumpsEffect = 100912;
 static constexpr ULONGLONG kRefreshMs = 500;
 // ChrIns apply SpEffect (chr, id, dont_sync), as fromsoftware-rs's ChrInsExt::apply_speffect
 static constexpr uintptr_t APPLY_SPEFFECT = 0x3e8dc0;
 static const uint8_t kApplyBytes[] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10, 0x57, 0x48, 0x81, 0xec, 0xc0 };
 
 static std::atomic<bool> s_On{ false };
+static std::atomic<bool> s_Jumps{ false };
 static int s_CodeOk = -1;  // -1 not checked yet
 static ULONGLONG s_AppliedAt = 0;
 static uintptr_t s_Player = 0;
@@ -46,7 +48,8 @@ static bool CodeOk() {
 }
 
 void RunFrame() {
-    if (!s_On || !Base()) return;
+    bool on = s_On, jumps = s_Jumps;
+    if ((!on && !jumps) || !Base()) return;
     uintptr_t wcm = Global(WORLD_CHR_MAN);
     uintptr_t player = wcm ? Ptr(wcm + MAIN_PLAYER) : 0;
     ULONGLONG now = GetTickCount64();
@@ -57,7 +60,9 @@ void RunFrame() {
     }
     if (!player || now < s_AppliedAt + kRefreshMs || !CodeOk()) return;
     s_AppliedAt = now;
-    reinterpret_cast<void (*)(uintptr_t, int32_t, bool)>(Base() + APPLY_SPEFFECT)(player, kOnEffect, true);
+    auto apply = reinterpret_cast<void (*)(uintptr_t, int32_t, bool)>(Base() + APPLY_SPEFFECT);
+    if (on) apply(player, kOnEffect, true);
+    if (jumps) apply(player, kJumpsEffect, true);
 }
 
 void DrawMenuSection(float scale) {
@@ -72,6 +77,15 @@ void DrawMenuSection(float scale) {
                           "Torrent climbs. In the air, jump to climb higher (again to keep climbing), run or\n"
                           "sprint to fly level, stand still to hover, walk to glide down; touching the ground\n"
                           "ends the flight. Switching this off in the air drops you, without fall damage.");
+    bool jumps = s_Jumps;
+    if (ImGui::Checkbox("Infinite Torrent jumps", &jumps)) {
+        s_Jumps = jumps;
+        Log("FlyingMount: infinite jumps %s", jumps ? "on" : "off (the marker runs out within 2 s)");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Only for you, and off again at every start. On Torrent, jump as often as you like in the\n"
+                          "air, for no stamina, and falls can't hurt you. Switching this off in the air, or getting\n"
+                          "off Torrent up there, is an ordinary fall.");
     if (s_CodeOk == 0) ImGui::TextColored(dim, "Not available: this game version's code isn't the one expected");
     (void)scale;
 }
